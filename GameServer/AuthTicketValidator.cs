@@ -22,6 +22,9 @@ namespace GameServer
     {
         private const int AllowedClockSkewMs = 5000;
         private const int MaxPlayerNameLength = 24;
+        private const int MaxNonceLength = 128;
+        private const int SignatureHexLength = 64;
+        private const int MaxAllowedSpellIdsCsvLength = 768;
         private const int MaxAllowedSpellCount = 64;
 
         private readonly byte[] _secretBytes;
@@ -64,9 +67,21 @@ namespace GameServer
                 return false;
             }
 
-            if (string.IsNullOrWhiteSpace(packet.Nonce) || packet.Nonce.Length > 128)
+            if (string.IsNullOrWhiteSpace(packet.Nonce) || packet.Nonce.Length > MaxNonceLength)
             {
                 error = "invalid-nonce";
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(packet.AllowedSpellIdsCsv) || packet.AllowedSpellIdsCsv.Length > MaxAllowedSpellIdsCsvLength)
+            {
+                error = "invalid-allowed-spells-shape";
+                return false;
+            }
+
+            if (!IsValidSignatureShape(packet.Signature))
+            {
+                error = "invalid-signature-shape";
                 return false;
             }
 
@@ -153,9 +168,30 @@ namespace GameServer
             if (left is null || right is null)
                 return false;
 
+            if (left.Length != right.Length)
+                return false;
+
             byte[] leftBytes = Encoding.UTF8.GetBytes(left);
             byte[] rightBytes = Encoding.UTF8.GetBytes(right);
             return CryptographicOperations.FixedTimeEquals(leftBytes, rightBytes);
+        }
+
+        private static bool IsValidSignatureShape(string signature)
+        {
+            if (string.IsNullOrWhiteSpace(signature) || signature.Length != SignatureHexLength)
+                return false;
+
+            for (int i = 0; i < signature.Length; i++)
+            {
+                char c = signature[i];
+                bool isHex = (c >= '0' && c <= '9')
+                             || (c >= 'A' && c <= 'F')
+                             || (c >= 'a' && c <= 'f');
+                if (!isHex)
+                    return false;
+            }
+
+            return true;
         }
 
         /// <summary>

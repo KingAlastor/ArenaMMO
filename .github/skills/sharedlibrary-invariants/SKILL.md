@@ -26,6 +26,8 @@ This skill defines protocol and shared-combat invariants Copilot must preserve w
 - Do not add heavy framework dependencies incompatible with Unity/.NET Standard 2.1.
 - Do not hide gameplay side effects inside SharedLibrary utilities.
 - Do not couple packet definitions to server-only persistence concerns.
+- Do not reorder canonical ticket fields without coordinated signer/verifier updates.
+- Do not remove action sequence fields from action intent packets; replay resistance depends on them.
 
 ## Compatibility Target
 - SharedLibrary targets .NET Standard 2.1.
@@ -49,6 +51,19 @@ This skill defines protocol and shared-combat invariants Copilot must preserve w
 - Status effect lifecycle packets exist and are visibility-aware:
   - StatusEffectAppliedPacket
   - StatusEffectRemovedPacket
+- AuthTicketPacket is the pre-auth identity/entitlement contract and includes:
+  - player identity and faction
+  - allowed spell entitlement list
+  - issued/expiry timestamps
+  - nonce and HMAC signature
+- AttackRequestPacket, SpellCastRequestPacket, and ShootRequestPacket carry ActionSequenceId for server-side replay rejection.
+
+## Auth and Intent Contract Rules
+- AuthTicketPacket canonicalization order is part of protocol compatibility; signer and verifier must stay in lockstep.
+- Keep ticket fields explicit and string/integer based for serializer stability across Unity and server runtimes.
+- ActionSequenceId semantics are monotonic per action stream and validated server-side; packet contracts must preserve this field.
+- TickNumber and targeting payloads are untrusted hints, not authority; contracts must not imply client final-state authority.
+- AllowedSpellIdsCsv remains data-only entitlement transport; gameplay legality is still enforced in GameServer.
 
 ## Enum and Targeting Invariants
 - SpellTargetType defines simulation mode (single target, AoE, projectile, melee splash).
@@ -93,6 +108,7 @@ Do not move authoritative validation into SharedLibrary data alone; data describ
 - SharedLibrary defines data contracts, not trust.
 - Do not introduce fields that imply client authority over final state.
 - The server remains the source of truth for all final combat outcomes.
+- Security-sensitive packet changes (auth/signature/sequence fields) require rollout compatibility notes for lobby, server, and Unity client.
 
 ## Review Checklist
 - No contract change accidentally grants client authority.
@@ -100,6 +116,7 @@ Do not move authoritative validation into SharedLibrary data alone; data describ
 - New fields have clear semantics and safe defaults.
 - Shared contracts still align with faction visibility and privacy constraints.
 - CombatMath remains pure and allocation-free.
+- AuthTicketPacket and action intent packet changes preserve anti-replay and auth compatibility assumptions.
 
 ## PR Gate Checklist
 - GameServer and SharedLibrary compile after contract edits.

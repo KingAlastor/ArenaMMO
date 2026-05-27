@@ -28,6 +28,27 @@ This skill defines the gameplay and networking invariants Copilot must preserve 
 - Do not introduce LINQ or high-allocation patterns in hot loops.
 - Do not reorder tick phases casually; this can introduce subtle behavior regressions.
 
+## Ingress Security Guardrails
+- Treat pre-auth peers as untrusted until AuthTicketPacket validation succeeds.
+- Preserve the pending-auth timeout path; peers that connect but do not authenticate in time must be disconnected.
+- Keep pre-auth IP abuse controls in place:
+  - sliding-window request limiting
+  - violation score tracking
+  - temporary IP bans after repeated violations
+- Keep packet shape/finite-value sanitization before intents enter simulation queues.
+- Keep intent admission centralized through IntentGuard:
+  - packet tick skew checks
+  - per-intent token-bucket rate limiting
+  - monotonic action sequence replay checks
+  - per-peer and global queue pressure limits
+- Keep spell entitlement checks server-side (authenticated loadout only).
+- Keep invalid ticket, replay, unauthorized spell, and rate-limit telemetry emitted for operational triage.
+
+## Ticket Validation Contract
+- Ticket validation must include all of: shape checks, clock-window checks, HMAC verification, nonce replay protection, and allowed-spell parsing.
+- Canonical ticket serialization field order is protocol-critical; do not reorder fields without coordinated lobby/client/server rollout.
+- Nonce replay protection must remain server-side and enforced before peer becomes authoritative in match state.
+
 ## Simulation Model
 - Fixed tick loop at 30 Hz in ArenaInstance.
 - Tick order matters and should stay stable:
@@ -120,6 +141,7 @@ If a change affects one phase, validate the neighboring phases still operate cor
 - Do not add direct SQL access into active match simulation code.
 - Match state lives in memory during simulation.
 - Preserve queue-based separation between network receive and simulation processing.
+- Preserve auth-first flow: no gameplay intent should mutate state for unauthenticated peers.
 
 ## Review Checklist
 - Server authority still intact for all touched mechanics.
@@ -127,6 +149,9 @@ If a change affects one phase, validate the neighboring phases still operate cor
 - Tick order and phase boundaries unchanged or intentionally documented.
 - No new hot-path allocations or LINQ introduced.
 - Packet semantics are still coherent with Unity client expectations.
+- Pre-auth gating, auth timeout, and IP abuse controls still protect connection ingress.
+- IntentGuard still enforces tick skew, replay resistance, and queue pressure limits.
+- Security telemetry still records key drop categories for incident analysis.
 
 ## PR Gate Checklist
 - Build succeeds for GameServer and SharedLibrary.

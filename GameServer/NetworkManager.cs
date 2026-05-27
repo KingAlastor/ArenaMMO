@@ -31,6 +31,7 @@ namespace GameServer
         // Sliding-window request cap to resist trivial connect flood attempts.
         private const int MaxConnectionRequestsPerWindow = 20;
         private const int ConnectionWindowMs = 10000;
+        private const int ViolationDecayPerWindow = 1;
         // Temporary IP ban duration applied after repeated violations.
         private const int BanDurationMs = 120000;
         private const int MaxIpViolationScore = 12;
@@ -219,6 +220,13 @@ namespace GameServer
 
                 if (nowMs - state.WindowStartMs >= ConnectionWindowMs)
                 {
+                    int windowsElapsed = (int)((nowMs - state.WindowStartMs) / ConnectionWindowMs);
+                    if (windowsElapsed > 0 && state.ViolationScore > 0)
+                    {
+                        int decay = windowsElapsed * ViolationDecayPerWindow;
+                        state.ViolationScore = Math.Max(0, state.ViolationScore - decay);
+                    }
+
                     state.WindowStartMs = nowMs;
                     state.RequestCount = 0;
                 }
