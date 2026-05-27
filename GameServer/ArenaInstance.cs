@@ -34,10 +34,11 @@ namespace GameServer
         // ── Input Queues ──────────────────────────────────────────────────────
         // Filled by network callbacks each tick; drained by ProcessTick().
 
-        private readonly ConcurrentQueue<(NetPeer Peer, PlayerInputPacket      Packet)> _inputQueue  = new();
+        private readonly ConcurrentDictionary<NetPeer, PlayerInputPacket> _latestInputByPeer = new();
         private readonly ConcurrentQueue<(NetPeer Peer, AttackRequestPacket    Packet)> _attackQueue = new();
         private readonly ConcurrentQueue<(NetPeer Peer, SpellCastRequestPacket Packet)> _spellQueue  = new();
         private readonly ConcurrentQueue<(NetPeer Peer, ShootRequestPacket     Packet)> _shootQueue  = new();
+        private readonly IntentGuard _intentGuard = new();
 
         // ── Projectile State ───────────────────────────────────────────
 
@@ -81,6 +82,7 @@ namespace GameServer
 
             _players.Add(session);
             _peerMap[peer] = session;
+            _intentGuard.OnPeerConnected(peer);
             Console.WriteLine($"[Arena] Spawned {session.PlayerName} (id={session.EntityId})");
         }
 
@@ -90,6 +92,8 @@ namespace GameServer
             {
                 _players.Remove(session);
                 _peerMap.Remove(peer);
+                _latestInputByPeer.TryRemove(peer, out _);
+                _intentGuard.OnPeerDisconnected(peer);
                 Console.WriteLine($"[Arena] Removed {session.PlayerName} (id={session.EntityId})");
             }
         }
@@ -97,16 +101,46 @@ namespace GameServer
         // ── Queue Entry Points (called from network callbacks) ────────────────
 
         public void EnqueueInput(NetPeer peer, PlayerInputPacket packet)
-            => _inputQueue.Enqueue((peer, packet));
+        {
+            if (!_intentGuard.TryAcceptIntent(peer, packet.TickNumber, IntentKind.Input, _tick, _peerMap.ContainsKey(peer)))
+                return;
+
+            // Keep only the latest input per peer to prevent scheduler spam from growing work.
+            _latestInputByPeer[peer] = packet;
+        }
 
         public void EnqueueAttack(NetPeer peer, AttackRequestPacket packet)
-            => _attackQueue.Enqueue((peer, packet));
+        {
+            if (!_intentGuard.TryAcceptIntent(peer, packet.TickNumber, IntentKind.Attack, _tick, _peerMap.ContainsKey(peer)))
+                return;
+
+            if (!_intentGuard.TryReserveActionSlot(peer, IntentKind.Attack))
+                return;
+
+            _attackQueue.Enqueue((peer, packet));
+        }
 
         public void EnqueueSpellCast(NetPeer peer, SpellCastRequestPacket packet)
-            => _spellQueue.Enqueue((peer, packet));
+        {
+            if (!_intentGuard.TryAcceptIntent(peer, packet.TickNumber, IntentKind.Spell, _tick, _peerMap.ContainsKey(peer)))
+                return;
+
+            if (!_intentGuard.TryReserveActionSlot(peer, IntentKind.Spell))
+                return;
+
+            _spellQueue.Enqueue((peer, packet));
+        }
 
         public void EnqueueShoot(NetPeer peer, ShootRequestPacket packet)
-            => _shootQueue.Enqueue((peer, packet));
+        {
+            if (!_intentGuard.TryAcceptIntent(peer, packet.TickNumber, IntentKind.Shoot, _tick, _peerMap.ContainsKey(peer)))
+                return;
+
+            if (!_intentGuard.TryReserveActionSlot(peer, IntentKind.Shoot))
+                return;
+
+            _shootQueue.Enqueue((peer, packet));
+        }
 
         // ── Game Loop ─────────────────────────────────────────────────────────
 
@@ -132,15 +166,19 @@ namespace GameServer
         private void ProcessTick()
         {
             // ── 1. Movement ───────────────────────────────────────────────────
-            while (_inputQueue.TryDequeue(out var entry))
+            foreach (KeyValuePair<NetPeer, PlayerInputPacket> entry in _latestInputByPeer)
             {
-                if (_peerMap.TryGetValue(entry.Peer, out PlayerSession? player))
-                    MovementSystem.ProcessInput(player, entry.Packet, DeltaTime);
+                if (!_latestInputByPeer.TryRemove(entry.Key, out PlayerInputPacket? latestInput))
+                    continue;
+
+                if (_peerMap.TryGetValue(entry.Key, out PlayerSession? player))
+                    MovementSystem.ProcessInput(player, latestInput, DeltaTime);
             }
 
             // ── 2. Melee auto-attacks ─────────────────────────────────────────
             while (_attackQueue.TryDequeue(out var entry))
             {
+                _intentGuard.ReleaseActionSlot(entry.Peer, IntentKind.Attack);
                 if (!_peerMap.TryGetValue(entry.Peer, out PlayerSession? attacker)) continue;
 
                 PlayerSession? target = FindById(entry.Packet.TargetEntityId);
@@ -155,6 +193,7 @@ namespace GameServer
             // ── 3. Spell casts ────────────────────────────────────────────────
             while (_spellQueue.TryDequeue(out var entry))
             {
+                _intentGuard.ReleaseActionSlot(entry.Peer, IntentKind.Spell);
                 if (!_peerMap.TryGetValue(entry.Peer, out PlayerSession? caster)) continue;
                 if (!SpellDatabase.TryGet(entry.Packet.SpellId, out SpellDefinition spell)) continue;
 
@@ -171,6 +210,7 @@ namespace GameServer
             // ── 4. Shoot requests (spawn projectiles) ─────────────────────────────
             while (_shootQueue.TryDequeue(out var entry))
             {
+                _intentGuard.ReleaseActionSlot(entry.Peer, IntentKind.Shoot);
                 if (!_peerMap.TryGetValue(entry.Peer, out PlayerSession? shooter)) continue;
                 if (!SpellDatabase.TryGet(entry.Packet.SpellId, out SpellDefinition spell)) continue;
                 if (spell.TargetType != SpellTargetType.Projectile) continue;

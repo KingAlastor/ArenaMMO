@@ -1,1 +1,61 @@
+# ------------------------------------------------------------
+# ArenaMMO shared source control policy
+# Keep source/config assets that teammates need.
+# Ignore local build outputs, caches, and machine-specific files.
+# ------------------------------------------------------------
+
+# ---------- .NET / C# build outputs (GameServer, SharedLibrary, Unity-generated csproj) ----------
+**/bin/
+**/obj/
+
+# User/machine specific
+*.user
+*.suo
+*.userprefs
+*.csproj.user
+*.sln.docstates
+.vs/
+
+# IDE caches
+.idea/
+.vscode/
+
+# ---------- Unity (UnityClient) ----------
+# Current team mode: server/shared-first. Ignore UnityClient by default.
 UnityClient/
+
+# If/when you want to share Unity too, remove the line above and use these rules:
+# Keep: Assets/, Packages/, ProjectSettings/
+# Ignore generated/local-only Unity folders:
+# UnityClient/[Ll]ibrary/
+# UnityClient/[Tt]emp/
+# UnityClient/[Oo]bj/
+# UnityClient/[Bb]uild/
+# UnityClient/[Bb]uilds/
+# UnityClient/[Ll]ogs/
+# UnityClient/[Uu]ser[Ss]ettings/
+# UnityClient/[Mm]emoryCaptures/
+# UnityClient/[Rr]ecordings/
+#
+# Unity generated / IDE sync files
+# UnityClient/*.csproj
+# UnityClient/*.unityproj
+# UnityClient/*.sln
+# UnityClient/*.pidb
+# UnityClient/*.booproj
+# UnityClient/*.svd
+# UnityClient/*.pdb
+# UnityClient/*.mdb
+# UnityClient/*.opendb
+# UnityClient/*.VC.db
+# UnityClient/*.pidb.meta
+# UnityClient/*.pdb.meta
+
+# ---------- OS junk ----------
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ---------- Logs / diagnostics ----------
+*.log
+*.tmp
