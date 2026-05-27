@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+	<Target Name="CopyToUnity" AfterTargets="Build">
+		<PropertyGroup>
+			<UnityPluginsDir>$(ProjectDir)..\UnityClient\Assets\Plugins\</UnityPluginsDir>
+		</PropertyGroup>
+
+		<MakeDir Directories="$(UnityPluginsDir)" Condition="!Exists('$(UnityPluginsDir)')" />
+
+		<Copy SourceFiles="$(TargetDir)$(TargetName).dll" DestinationFolder="$(UnityPluginsDir)" ContinueOnError="false" />
+		<Copy SourceFiles="$(TargetDir)$(TargetName).pdb" DestinationFolder="$(UnityPluginsDir)" ContinueOnError="false" />
+
+		<Message Importance="high" Text="Successfully copied compiled $(TargetName).dll framework directly to Unity Assets!" />
+	</Target>
+
+</Project>
