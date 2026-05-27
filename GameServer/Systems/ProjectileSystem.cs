@@ -79,10 +79,26 @@ namespace GameServer.Systems
             SpellDefinition    spell,
             int                projectileId)
         {
+            if (!float.IsFinite(request.DirectionX) || !float.IsFinite(request.DirectionY))
+                return null;
+
+            if (!float.IsFinite(spell.ProjectileSpeed) || spell.ProjectileSpeed <= 0f)
+                return null;
+
+            if (!float.IsFinite(spell.ProjectileHitRadius) || spell.ProjectileHitRadius <= 0f)
+                return null;
+
+            if (!float.IsFinite(spell.Range) || spell.Range <= 0f)
+                return null;
+
             // Re-normalise the client-supplied direction — never trust raw client values
             float mag = MathF.Sqrt(request.DirectionX * request.DirectionX +
                                    request.DirectionY * request.DirectionY);
-            if (mag < 0.001f)
+            if (!float.IsFinite(mag) || mag < 0.001f)
+                return null;
+
+            float maxRange = spell.Range * shooter.ProjectileRangeMultiplier;
+            if (!float.IsFinite(maxRange) || maxRange <= 0f)
                 return null;
 
             return new ProjectileState
@@ -96,7 +112,7 @@ namespace GameServer.Systems
                 Speed             = spell.ProjectileSpeed,
                 HitRadius         = spell.ProjectileHitRadius,
                 // Range scales with the shooter's stat — snapshotted at launch time
-                MaxRange          = spell.Range * shooter.ProjectileRangeMultiplier,
+                MaxRange          = maxRange,
                 BaseDamage        = spell.BaseDamage,
                 AttackPower       = shooter.AttackPower,       // snapshot at launch time
                 CritChance        = shooter.CritChance,
@@ -141,10 +157,31 @@ namespace GameServer.Systems
             for (int i = projectiles.Count - 1; i >= 0; i--)
             {
                 ProjectileState proj = projectiles[i];
+                if (!float.IsFinite(proj.Position.X)
+                    || !float.IsFinite(proj.Position.Y)
+                    || !float.IsFinite(proj.DirectionX)
+                    || !float.IsFinite(proj.DirectionY)
+                    || !float.IsFinite(proj.Speed)
+                    || !float.IsFinite(proj.TraveledDistance)
+                    || !float.IsFinite(proj.MaxRange))
+                {
+                    expiredIds ??= new List<int>();
+                    expiredIds.Add(proj.ProjectileId);
+                    projectiles.RemoveAt(i);
+                    continue;
+                }
 
                 // ── Move ──────────────────────────────────────────────────────
                 // Direction is normalised, so distance = Speed × deltaTime exactly
                 float step = proj.Speed * deltaTime;
+                if (!float.IsFinite(step) || step <= 0f)
+                {
+                    expiredIds ??= new List<int>();
+                    expiredIds.Add(proj.ProjectileId);
+                    projectiles.RemoveAt(i);
+                    continue;
+                }
+
                 proj.Position = new Vec2(
                     proj.Position.X + proj.DirectionX * step,
                     proj.Position.Y + proj.DirectionY * step);
@@ -264,6 +301,9 @@ namespace GameServer.Systems
                     continue;
 
                 if (!CombatMath.IsInAoE(proj.Position, proj.AoERadius, splash.Position))
+                    continue;
+
+                if (!MatchesFactionFilter(proj.TargetFactionFilter, allPlayers, proj.OwnerId, splash))
                     continue;
 
                 int  splashDmg  = CombatMath.CalculateDamage(proj.BaseDamage, proj.AttackPower, splash.Armor);

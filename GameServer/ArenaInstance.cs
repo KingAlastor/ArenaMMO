@@ -5,6 +5,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Net;
 using System.Threading;
 
 namespace GameServer
@@ -21,6 +22,7 @@ namespace GameServer
     /// </summary>
     public sealed class ArenaInstance
     {
+        // Simulation cadence. Keep these aligned with client prediction/interpolation assumptions.
         private const int   TickRate  = 30;
         private const float DeltaTime = 1f / TickRate;
         private const int   MsPerTick = 1000 / TickRate;
@@ -38,7 +40,10 @@ namespace GameServer
         private readonly ConcurrentQueue<(NetPeer Peer, AttackRequestPacket    Packet)> _attackQueue = new();
         private readonly ConcurrentQueue<(NetPeer Peer, SpellCastRequestPacket Packet)> _spellQueue  = new();
         private readonly ConcurrentQueue<(NetPeer Peer, ShootRequestPacket     Packet)> _shootQueue  = new();
+        // IntentGuard enforces anti-spam, tick skew, and replay rules before intents enter simulation.
         private readonly IntentGuard _intentGuard = new();
+        // Ticket validator is the trust boundary between lobby-issued identity and live arena authority.
+        private readonly AuthTicketValidator _ticketValidator;
 
         // ── Projectile State ───────────────────────────────────────────
 
@@ -56,6 +61,15 @@ namespace GameServer
 
         // ── Entry Point ───────────────────────────────────────────────────────
 
+        /// <summary>
+        /// Creates one arena runtime with a ticket validator bound to the configured signing secret.
+        /// The secret is never rotated in-process; restart the server after secret changes.
+        /// </summary>
+        public ArenaInstance(string ticketSecret)
+        {
+            _ticketValidator = new AuthTicketValidator(ticketSecret);
+        }
+
         /// <summary>Starts the network listener and blocks on the game loop until shutdown.</summary>
         public void Start(int port)
         {
@@ -67,23 +81,45 @@ namespace GameServer
 
         // ── Connection Lifecycle ──────────────────────────────────────────────
 
-        public void OnPlayerConnected(NetPeer peer)
+        /// <summary>
+        /// Validates a lobby-issued auth ticket and materializes a PlayerSession only on success.
+        /// This is the only legal path that inserts a peer into authoritative player collections.
+        /// </summary>
+        public bool TryAuthenticatePeer(NetPeer peer, AuthTicketPacket ticket, IPAddress? ip)
+        {
+            if (!_ticketValidator.TryValidate(ticket, out AuthenticatedPeerContext context, out string error))
+            {
+                SecurityTelemetry.RecordInvalidTicket(error, ip);
+                return false;
+            }
+
+            OnPlayerAuthenticated(peer, context);
+            return true;
+        }
+
+        /// <summary>
+        /// Initializes authoritative in-match state from authenticated context.
+        /// Note: combat stats are still placeholder defaults until profile hydration is integrated.
+        /// </summary>
+        private void OnPlayerAuthenticated(NetPeer peer, AuthenticatedPeerContext context)
         {
             var session = new PlayerSession
             {
+                AccountId  = context.PlayerId,
                 EntityId   = _nextEntityId++,
-                PlayerName = $"Player_{peer.Id}",
+                PlayerName = context.PlayerName,
                 Peer       = peer,
-                Faction    = (_players.Count & 1) == 0 ? FactionId.Alpha : FactionId.Beta,
+                Faction    = context.Faction,
                 Position   = Vec2.Zero,
                 Health     = 100f,
                 MaxHealth  = 100f,
             };
+            session.ReplaceAllowedSpells(context.AllowedSpellIds);
 
             _players.Add(session);
             _peerMap[peer] = session;
             _intentGuard.OnPeerConnected(peer);
-            Console.WriteLine($"[Arena] Spawned {session.PlayerName} (id={session.EntityId})");
+            Console.WriteLine($"[Arena] Authenticated {session.PlayerName} (account={session.AccountId}, entity={session.EntityId})");
         }
 
         public void OnPlayerDisconnected(NetPeer peer)
@@ -102,6 +138,14 @@ namespace GameServer
 
         public void EnqueueInput(NetPeer peer, PlayerInputPacket packet)
         {
+            // Packet shape/float sanity gate. This blocks NaN/Inf poisoning and malformed payloads
+            // before any per-tick movement math runs.
+            if (!InputSanitizer.IsValid(packet))
+            {
+                SecurityTelemetry.RecordInvalidPacket("invalid-input-packet", peer);
+                return;
+            }
+
             if (!_intentGuard.TryAcceptIntent(peer, packet.TickNumber, IntentKind.Input, _tick, _peerMap.ContainsKey(peer)))
                 return;
 
@@ -111,8 +155,18 @@ namespace GameServer
 
         public void EnqueueAttack(NetPeer peer, AttackRequestPacket packet)
         {
-            if (!_intentGuard.TryAcceptIntent(peer, packet.TickNumber, IntentKind.Attack, _tick, _peerMap.ContainsKey(peer)))
+            // Action packets must carry monotonic sequence IDs for replay resistance.
+            if (!InputSanitizer.IsValid(packet))
+            {
+                SecurityTelemetry.RecordInvalidPacket("invalid-attack-packet", peer);
                 return;
+            }
+
+            if (!_intentGuard.TryAcceptIntent(peer, packet.TickNumber, IntentKind.Attack, _tick, _peerMap.ContainsKey(peer), packet.ActionSequenceId))
+            {
+                SecurityTelemetry.RecordReplayDrop("attack-sequence-or-rate-rejected", peer);
+                return;
+            }
 
             if (!_intentGuard.TryReserveActionSlot(peer, IntentKind.Attack))
                 return;
@@ -122,8 +176,28 @@ namespace GameServer
 
         public void EnqueueSpellCast(NetPeer peer, SpellCastRequestPacket packet)
         {
-            if (!_intentGuard.TryAcceptIntent(peer, packet.TickNumber, IntentKind.Spell, _tick, _peerMap.ContainsKey(peer)))
+            if (!InputSanitizer.IsValid(packet))
+            {
+                SecurityTelemetry.RecordInvalidPacket("invalid-spell-packet", peer);
                 return;
+            }
+
+            // Gate by authenticated loadout entitlement. Clients can request any spellId,
+            // but only server-authorized spell IDs are admitted.
+            if (!_peerMap.TryGetValue(peer, out PlayerSession? caster))
+                return;
+
+            if (!caster.IsSpellAllowed(packet.SpellId))
+            {
+                SecurityTelemetry.RecordUnauthorizedSpell(peer, packet.SpellId);
+                return;
+            }
+
+            if (!_intentGuard.TryAcceptIntent(peer, packet.TickNumber, IntentKind.Spell, _tick, true, packet.ActionSequenceId))
+            {
+                SecurityTelemetry.RecordReplayDrop("spell-sequence-or-rate-rejected", peer);
+                return;
+            }
 
             if (!_intentGuard.TryReserveActionSlot(peer, IntentKind.Spell))
                 return;
@@ -133,8 +207,27 @@ namespace GameServer
 
         public void EnqueueShoot(NetPeer peer, ShootRequestPacket packet)
         {
-            if (!_intentGuard.TryAcceptIntent(peer, packet.TickNumber, IntentKind.Shoot, _tick, _peerMap.ContainsKey(peer)))
+            if (!InputSanitizer.IsValid(packet))
+            {
+                SecurityTelemetry.RecordInvalidPacket("invalid-shoot-packet", peer);
                 return;
+            }
+
+            // Shoot requests share the same entitlement model as spell casts.
+            if (!_peerMap.TryGetValue(peer, out PlayerSession? shooter))
+                return;
+
+            if (!shooter.IsSpellAllowed(packet.SpellId))
+            {
+                SecurityTelemetry.RecordUnauthorizedSpell(peer, packet.SpellId);
+                return;
+            }
+
+            if (!_intentGuard.TryAcceptIntent(peer, packet.TickNumber, IntentKind.Shoot, _tick, true, packet.ActionSequenceId))
+            {
+                SecurityTelemetry.RecordReplayDrop("shoot-sequence-or-rate-rejected", peer);
+                return;
+            }
 
             if (!_intentGuard.TryReserveActionSlot(peer, IntentKind.Shoot))
                 return;
@@ -156,6 +249,10 @@ namespace GameServer
                 ProcessTick();             // drain queues & run authoritative simulation
                 BroadcastState();          // push authoritative positions + health to all peers
 
+                // Emit periodic security counters to provide low-cost operational observability.
+                if ((_tick % (TickRate * 10)) == 0)
+                    SecurityTelemetry.PrintSnapshot();
+
                 _tick++;
 
                 int sleep = MsPerTick - (int)sw.ElapsedMilliseconds;
@@ -165,6 +262,9 @@ namespace GameServer
 
         private void ProcessTick()
         {
+            // Tick order is intentionally fixed. Reordering phases can change gameplay semantics
+            // (for example, movement-before-combat range checks and projectile-before-DoT timing).
+
             // ── 1. Movement ───────────────────────────────────────────────────
             foreach (KeyValuePair<NetPeer, PlayerInputPacket> entry in _latestInputByPeer)
             {
@@ -195,6 +295,7 @@ namespace GameServer
             {
                 _intentGuard.ReleaseActionSlot(entry.Peer, IntentKind.Spell);
                 if (!_peerMap.TryGetValue(entry.Peer, out PlayerSession? caster)) continue;
+                if (!caster.IsSpellAllowed(entry.Packet.SpellId)) continue;
                 if (!SpellDatabase.TryGet(entry.Packet.SpellId, out SpellDefinition spell)) continue;
 
                 var statusEffects = new List<StatusEffectAppliedPacket>();
@@ -212,6 +313,7 @@ namespace GameServer
             {
                 _intentGuard.ReleaseActionSlot(entry.Peer, IntentKind.Shoot);
                 if (!_peerMap.TryGetValue(entry.Peer, out PlayerSession? shooter)) continue;
+                if (!shooter.IsSpellAllowed(entry.Packet.SpellId)) continue;
                 if (!SpellDatabase.TryGet(entry.Packet.SpellId, out SpellDefinition spell)) continue;
                 if (spell.TargetType != SpellTargetType.Projectile) continue;
                 if (!shooter.IsAlive) continue;

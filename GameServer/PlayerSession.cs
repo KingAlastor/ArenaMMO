@@ -14,6 +14,7 @@ namespace GameServer
     /// </summary>
     public sealed class PlayerSession
     {
+        public int      AccountId   { get; set; }
         public int      EntityId    { get; set; }
         public string   PlayerName  { get; set; } = string.Empty;
         public NetPeer? Peer        { get; set; }
@@ -63,6 +64,7 @@ namespace GameServer
         private readonly Dictionary<int, ActiveStatusEffect> _statusEffects = new Dictionary<int, ActiveStatusEffect>();
         private readonly List<int> _statusEffectKeysBuffer = new List<int>();
         private readonly List<int> _expiredStatusEffectIds = new List<int>();
+        private readonly HashSet<int> _allowedSpellIds = new HashSet<int>();
 
         // spellId (0 = basic auto-attack) → last tick it was activated
         private readonly Dictionary<int, int> _cooldowns = new Dictionary<int, int>();
@@ -228,6 +230,19 @@ namespace GameServer
             Health += amount;
             if (Health > MaxHealth) Health = MaxHealth;
         }
+
+        public void ReplaceAllowedSpells(IEnumerable<int> spellIds)
+        {
+            _allowedSpellIds.Clear();
+            foreach (int spellId in spellIds)
+            {
+                if (spellId > 0)
+                    _allowedSpellIds.Add(spellId);
+            }
+        }
+
+        public bool IsSpellAllowed(int spellId)
+            => _allowedSpellIds.Contains(spellId);
 
         private static PlayerSession? FindById(IReadOnlyList<PlayerSession> players, int entityId)
         {

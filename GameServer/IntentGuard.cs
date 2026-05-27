@@ -5,6 +5,9 @@ using System.Threading;
 
 namespace GameServer
 {
+    /// <summary>
+    /// Intent categories used for independent rate and replay controls.
+    /// </summary>
     internal enum IntentKind : byte
     {
         Input,
@@ -13,13 +16,25 @@ namespace GameServer
         Shoot,
     }
 
+    /// <summary>
+    /// Central abuse-control gate for client intents.
+    ///
+    /// Responsibilities:
+    /// 1) Tick skew validation (past/future drift).
+    /// 2) Token-bucket rate limiting per intent kind.
+    /// 3) Monotonic sequence checks for action replay resistance.
+    /// 4) Per-peer and global action queue pressure limits.
+    /// </summary>
     internal sealed class IntentGuard
     {
+        // Allowed clock drift between client-reported tick and server tick.
         private const int MaxPastTickSkew   = 2;
         private const int MaxFutureTickSkew = 5;
 
+        // Token bucket refill rates.
         private const double InputRatePerSecond  = 60.0;
         private const double ActionRatePerSecond = 20.0;
+        // Token bucket capacities (burst allowance).
         private const double InputBurstTokens    = 30.0;
         private const double ActionBurstTokens   = 10.0;
 
@@ -32,6 +47,7 @@ namespace GameServer
 
         private sealed class PeerGuardState
         {
+            // Per-peer lock; guards all mutable fields below.
             public readonly object Gate = new object();
 
             public double InputTokens;
@@ -43,6 +59,9 @@ namespace GameServer
             public int ViolationScore;
 
             public int LastAcceptedInputTick;
+            public int LastAcceptedAttackSequence;
+            public int LastAcceptedSpellSequence;
+            public int LastAcceptedShootSequence;
 
             public int PendingAttack;
             public int PendingSpell;
@@ -56,6 +75,9 @@ namespace GameServer
                 ShootTokens           = ActionBurstTokens;
                 LastRefillMs          = nowMs;
                 LastAcceptedInputTick = int.MinValue;
+                LastAcceptedAttackSequence = 0;
+                LastAcceptedSpellSequence  = 0;
+                LastAcceptedShootSequence  = 0;
             }
         }
 
@@ -70,8 +92,15 @@ namespace GameServer
         public void OnPeerDisconnected(NetPeer peer)
             => _peerGuards.TryRemove(peer, out _);
 
-        public bool TryAcceptIntent(NetPeer peer, int packetTick, IntentKind kind, int currentTick, bool isKnownPeer)
+        public bool TryAcceptIntent(
+            NetPeer peer,
+            int packetTick,
+            IntentKind kind,
+            int currentTick,
+            bool isKnownPeer,
+            int actionSequenceId = 0)
         {
+            // Unknown peers are dropped at the gate to enforce auth-first behavior.
             if (!isKnownPeer)
                 return false;
 
@@ -82,15 +111,37 @@ namespace GameServer
             {
                 RefillTokens(guard, Environment.TickCount64);
 
+                // Reject heavily skewed packet ticks to prevent old/future intent injection.
                 if (packetTick < currentTick - MaxPastTickSkew || packetTick > currentTick + MaxFutureTickSkew)
                 {
                     disconnect = RegisterViolationLocked(guard, 3);
                     goto Finalize;
                 }
 
+                // Movement packets are allowed to overwrite older ones; only monotonic progression
+                // is required to avoid stale-input rewinds.
                 if (kind == IntentKind.Input && packetTick < guard.LastAcceptedInputTick)
                     goto Finalize;
 
+                if (kind != IntentKind.Input)
+                {
+                    // Action intents must provide a positive sequence id.
+                    if (actionSequenceId <= 0)
+                    {
+                        disconnect = RegisterViolationLocked(guard, 3);
+                        goto Finalize;
+                    }
+
+                    // Strict monotonic enforcement drops duplicates and replayed actions.
+                    ref int lastSequenceRef = ref GetLastActionSequenceRef(guard, kind);
+                    if (actionSequenceId <= lastSequenceRef)
+                    {
+                        disconnect = RegisterViolationLocked(guard, 2);
+                        goto Finalize;
+                    }
+                }
+
+                // Token bucket check controls sustained and burst throughput.
                 ref double tokens = ref GetTokenBucketRef(guard, kind);
                 if (tokens < 1.0)
                 {
@@ -101,6 +152,12 @@ namespace GameServer
                 tokens -= 1.0;
                 if (kind == IntentKind.Input)
                     guard.LastAcceptedInputTick = packetTick;
+                else
+                {
+                    // Update replay frontier only after all gate checks pass.
+                    ref int lastSequenceRef = ref GetLastActionSequenceRef(guard, kind);
+                    lastSequenceRef = actionSequenceId;
+                }
 
                 if (guard.ViolationScore > 0)
                     guard.ViolationScore--;
@@ -146,6 +203,7 @@ namespace GameServer
             if (depth <= GetQueueLimit(kind))
                 return true;
 
+            // Roll back local/global queue accounting when global depth is exceeded.
             Interlocked.Decrement(ref depthRef);
             lock (guard.Gate)
             {
@@ -165,6 +223,7 @@ namespace GameServer
 
         public void ReleaseActionSlot(NetPeer peer, IntentKind kind)
         {
+            // Global depth decremented first to avoid queue leaks in exceptional paths.
             ref int depthRef = ref GetQueueDepthRef(kind);
             Interlocked.Decrement(ref depthRef);
 
@@ -193,6 +252,7 @@ namespace GameServer
             double elapsedSeconds = elapsedMs / 1000.0;
             guard.LastRefillMs = nowMs;
 
+            // Clamp back to burst capacity so idle peers cannot accumulate unbounded credit.
             guard.InputTokens  = Math.Min(InputBurstTokens,  guard.InputTokens  + InputRatePerSecond * elapsedSeconds);
             guard.AttackTokens = Math.Min(ActionBurstTokens, guard.AttackTokens + ActionRatePerSecond * elapsedSeconds);
             guard.SpellTokens  = Math.Min(ActionBurstTokens, guard.SpellTokens  + ActionRatePerSecond * elapsedSeconds);
@@ -224,6 +284,19 @@ namespace GameServer
                     return ref guard.PendingSpell;
                 default:
                     return ref guard.PendingShoot;
+            }
+        }
+
+        private static ref int GetLastActionSequenceRef(PeerGuardState guard, IntentKind kind)
+        {
+            switch (kind)
+            {
+                case IntentKind.Attack:
+                    return ref guard.LastAcceptedAttackSequence;
+                case IntentKind.Spell:
+                    return ref guard.LastAcceptedSpellSequence;
+                default:
+                    return ref guard.LastAcceptedShootSequence;
             }
         }
 

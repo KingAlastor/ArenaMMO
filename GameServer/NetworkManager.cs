@@ -2,8 +2,11 @@ using LiteNetLib;
 using LiteNetLib.Utils;
 using SharedLibrary;
 using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
 
 namespace GameServer
 {
@@ -16,10 +19,43 @@ namespace GameServer
         private readonly NetManager        _net;
         private readonly NetPacketProcessor _processor;
         private readonly ArenaInstance     _arena;
+        // Connected peers that have not yet proven identity with AuthTicketPacket.
+        private readonly ConcurrentDictionary<NetPeer, long> _pendingAuthPeers = new();
+        // Lightweight per-IP abuse guard used during pre-auth connection pressure.
+        private readonly ConcurrentDictionary<IPAddress, IpGuardState> _ipGuards = new();
 
         // Must match the key sent by the Unity client in NetManager.Connect(...)
         private const string ConnectionKey = "ArenaMMO_v1";
+        // Max wait time after UDP connect before auth ticket must be received.
+        private const int AuthTimeoutMs = 5000;
+        // Sliding-window request cap to resist trivial connect flood attempts.
+        private const int MaxConnectionRequestsPerWindow = 20;
+        private const int ConnectionWindowMs = 10000;
+        // Temporary IP ban duration applied after repeated violations.
+        private const int BanDurationMs = 120000;
+        private const int MaxIpViolationScore = 12;
 
+        /// <summary>
+        /// Mutable state for pre-auth IP abuse mitigation.
+        /// </summary>
+        private sealed class IpGuardState
+        {
+            public readonly object Gate = new object();
+            public int RequestCount;
+            public long WindowStartMs;
+            public long BannedUntilMs;
+            public int ViolationScore;
+
+            public IpGuardState(long nowMs)
+            {
+                WindowStartMs = nowMs;
+            }
+        }
+
+        /// <summary>
+        /// Initializes LiteNetLib listeners and packet dispatch subscriptions.
+        /// All packet handlers route into ArenaInstance, which remains the authority owner.
+        /// </summary>
         public NetworkManager(ArenaInstance arena, int port)
         {
             _arena     = arena;
@@ -29,7 +65,8 @@ namespace GameServer
             _processor.SubscribeReusable<PlayerInputPacket,      NetPeer>(OnPlayerInput);
             _processor.SubscribeReusable<AttackRequestPacket,    NetPeer>(OnAttackRequest);
             _processor.SubscribeReusable<SpellCastRequestPacket, NetPeer>(OnSpellCastRequest);
-            _processor.SubscribeReusable<ShootRequestPacket,     NetPeer>(OnShootRequest);  
+            _processor.SubscribeReusable<ShootRequestPacket,     NetPeer>(OnShootRequest);
+            _processor.SubscribeReusable<AuthTicketPacket,       NetPeer>(OnAuthTicket);
 
             _net = new NetManager(this) { AutoRecycle = true };
             _net.Start(port);
@@ -41,7 +78,13 @@ namespace GameServer
         /// Must be called once per game tick to dispatch all queued LiteNetLib events.
         /// All INetEventListener callbacks fire synchronously on the calling thread.
         /// </summary>
-        public void PollEvents() => _net.PollEvents();
+        public void PollEvents()
+        {
+            _net.PollEvents();
+            // Keep this in PollEvents so timeout handling runs in the same thread model
+            // as other network callbacks.
+            DisconnectAuthTimeoutPeers();
+        }
 
         /// <summary>Serialises and broadcasts a packet to every connected peer.</summary>
         public void SendToAll<T>(T packet, DeliveryMethod method) where T : class, new()
@@ -64,19 +107,32 @@ namespace GameServer
 
         public void OnConnectionRequest(ConnectionRequest request)
         {
-            // Reject connections that do not supply the correct version key
+            // Step 1: pre-auth IP abuse filtering.
+            IPEndPoint? remote = request.RemoteEndPoint;
+            if (remote != null && IsIpRejected(remote.Address, out bool isRateLimited))
+            {
+                if (isRateLimited)
+                    SecurityTelemetry.RecordIpRateLimit(remote.Address);
+
+                request.Reject();
+                return;
+            }
+
+            // Step 2: protocol/version key check.
             request.AcceptIfKey(ConnectionKey);
         }
 
         public void OnPeerConnected(NetPeer peer)
         {
             Console.WriteLine($"[Network] Peer connected: {peer.Address}");
-            _arena.OnPlayerConnected(peer);
+            // Connected does not mean trusted; peer remains pending until AuthTicketPacket validates.
+            _pendingAuthPeers[peer] = Environment.TickCount64;
         }
 
         public void OnPeerDisconnected(NetPeer peer, DisconnectInfo info)
         {
             Console.WriteLine($"[Network] Peer disconnected: {peer.Address} ({info.Reason})");
+            _pendingAuthPeers.TryRemove(peer, out _);
             _arena.OnPlayerDisconnected(peer);
         }
 
@@ -103,6 +159,100 @@ namespace GameServer
 
         private void OnShootRequest(ShootRequestPacket packet, NetPeer peer)
             => _arena.EnqueueShoot(peer, packet);
+
+        private void OnAuthTicket(AuthTicketPacket packet, NetPeer peer)
+        {
+            // Ignore duplicate late auth packets for already-authenticated peers.
+            if (!_pendingAuthPeers.ContainsKey(peer))
+                return;
+
+            if (_arena.TryAuthenticatePeer(peer, packet, peer.Address))
+            {
+                _pendingAuthPeers.TryRemove(peer, out _);
+                return;
+            }
+
+            // Invalid ticket is treated as a high-severity pre-auth violation.
+            RegisterIpViolation(peer.Address, 4);
+            peer.Disconnect();
+        }
+
+        /// <summary>
+        /// Disconnects peers that connected but never authenticated in time.
+        /// </summary>
+        private void DisconnectAuthTimeoutPeers()
+        {
+            if (_pendingAuthPeers.Count == 0)
+                return;
+
+            long nowMs = Environment.TickCount64;
+            var timedOut = new List<NetPeer>();
+            foreach (KeyValuePair<NetPeer, long> entry in _pendingAuthPeers)
+            {
+                if (nowMs - entry.Value >= AuthTimeoutMs)
+                    timedOut.Add(entry.Key);
+            }
+
+            for (int i = 0; i < timedOut.Count; i++)
+            {
+                NetPeer peer = timedOut[i];
+                _pendingAuthPeers.TryRemove(peer, out _);
+                RegisterIpViolation(peer.Address, 2);
+                SecurityTelemetry.RecordInvalidTicket("auth-timeout", peer.Address);
+                peer.Disconnect();
+            }
+        }
+
+        /// <summary>
+        /// Returns true when an IP should be rejected for rate-limit or active temporary ban.
+        /// </summary>
+        private bool IsIpRejected(IPAddress ipAddress, out bool isRateLimited)
+        {
+            isRateLimited = false;
+            long nowMs = Environment.TickCount64;
+            IpGuardState state = _ipGuards.GetOrAdd(ipAddress, _ => new IpGuardState(nowMs));
+
+            lock (state.Gate)
+            {
+                if (state.BannedUntilMs > nowMs)
+                    return true;
+
+                if (nowMs - state.WindowStartMs >= ConnectionWindowMs)
+                {
+                    state.WindowStartMs = nowMs;
+                    state.RequestCount = 0;
+                }
+
+                state.RequestCount++;
+                if (state.RequestCount <= MaxConnectionRequestsPerWindow)
+                    return false;
+
+                state.ViolationScore += 2;
+                isRateLimited = true;
+                if (state.ViolationScore >= MaxIpViolationScore)
+                    state.BannedUntilMs = nowMs + BanDurationMs;
+
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Raises violation score for an IP and applies temporary ban when threshold is exceeded.
+        /// </summary>
+        private void RegisterIpViolation(IPAddress? address, int severity)
+        {
+            if (address == null)
+                return;
+
+            long nowMs = Environment.TickCount64;
+            IpGuardState state = _ipGuards.GetOrAdd(address, _ => new IpGuardState(nowMs));
+            lock (state.Gate)
+            {
+                state.ViolationScore += severity;
+                if (state.ViolationScore >= MaxIpViolationScore)
+                    state.BannedUntilMs = nowMs + BanDurationMs;
+            }
+        }
 
         public void Dispose() => _net.Stop();
     }

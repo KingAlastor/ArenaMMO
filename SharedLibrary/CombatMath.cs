@@ -21,6 +21,18 @@ namespace SharedLibrary
         public static Vec2 Move(Vec2 current, float inputX, float inputY, float deltaTime,
                                 float speed = DefaultMoveSpeed)
         {
+            if (!float.IsFinite(current.X) || !float.IsFinite(current.Y))
+                current = Vec2.Zero;
+
+            if (!float.IsFinite(inputX) || !float.IsFinite(inputY))
+                return current;
+
+            if (!float.IsFinite(deltaTime) || deltaTime <= 0f)
+                return current;
+
+            if (!float.IsFinite(speed) || speed <= 0f)
+                speed = DefaultMoveSpeed;
+
             float newX = Clamp(current.X + inputX * speed * deltaTime, -ArenaBoundsHalf, ArenaBoundsHalf);
             float newY = Clamp(current.Y + inputY * speed * deltaTime, -ArenaBoundsHalf, ArenaBoundsHalf);
             return new Vec2(newX, newY);
@@ -90,6 +102,6 @@ namespace SharedLibrary
         // ── Helpers ───────────────────────────────────────────────────────────
 
         private static float Clamp(float v, float min, float max)
-            => v < min ? min : v > max ? max : v;
+            => !float.IsFinite(v) ? 0f : v < min ? min : v > max ? max : v;
     }
 }

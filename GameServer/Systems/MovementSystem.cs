@@ -18,9 +18,15 @@ namespace GameServer.Systems
             if (!player.IsAlive)
                 return;
 
+            if (!float.IsFinite(input.InputX) || !float.IsFinite(input.InputY))
+                return;
+
             // Normalise so diagonal movement (|input| ≈ 1.41) cannot exceed base speed.
             // If magnitude <= 1 (cardinal or idle), use the raw values as-is.
             float magnitude = MathF.Sqrt(input.InputX * input.InputX + input.InputY * input.InputY);
+            if (!float.IsFinite(magnitude) || magnitude <= 0f)
+                return;
+
             float normX = magnitude > 1f ? input.InputX / magnitude : input.InputX;
             float normY = magnitude > 1f ? input.InputY / magnitude : input.InputY;
 

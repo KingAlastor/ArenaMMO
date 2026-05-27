@@ -63,6 +63,7 @@ namespace SharedLibrary
     public class AttackRequestPacket
     {
         public int TickNumber     { get; set; }
+        public int ActionSequenceId { get; set; }
         public int TargetEntityId { get; set; }
     }
 
@@ -75,10 +76,27 @@ namespace SharedLibrary
     public class SpellCastRequestPacket
     {
         public int   TickNumber     { get; set; }
+        public int   ActionSequenceId { get; set; }
         public int   SpellId        { get; set; }
         public int   TargetEntityId { get; set; }
         public float AoECenterX     { get; set; }
         public float AoECenterY     { get; set; }
+    }
+
+    /// <summary>
+    /// Sent once after connection to prove lobby-issued identity and authorization.
+    /// Signature is HMAC-SHA256 over canonical ticket fields (without Signature).
+    /// </summary>
+    public class AuthTicketPacket
+    {
+        public int   PlayerId        { get; set; }
+        public string PlayerName     { get; set; } = string.Empty;
+        public byte  Faction         { get; set; }
+        public string AllowedSpellIdsCsv { get; set; } = string.Empty;
+        public long  IssuedAtUnixMs  { get; set; }
+        public long  ExpiresAtUnixMs { get; set; }
+        public string Nonce          { get; set; } = string.Empty;
+        public string Signature      { get; set; } = string.Empty;
     }
 
     // ── Server → Client Packets ───────────────────────────────────────────────
@@ -155,6 +173,7 @@ namespace SharedLibrary
     public class ShootRequestPacket
     {
         public int   TickNumber  { get; set; }
+        public int   ActionSequenceId { get; set; }
         public int   SpellId     { get; set; }
         public float DirectionX  { get; set; }  // normalised aim direction
         public float DirectionY  { get; set; }
