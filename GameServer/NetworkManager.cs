@@ -23,6 +23,9 @@ namespace GameServer
         private readonly ConcurrentDictionary<NetPeer, long> _pendingAuthPeers = new();
         // Lightweight per-IP abuse guard used during pre-auth connection pressure.
         private readonly ConcurrentDictionary<IPAddress, IpGuardState> _ipGuards = new();
+        // Reused across every send call to eliminate per-call heap allocation.
+        // All sends occur on the single game-loop thread, so no lock is required.
+        private readonly NetDataWriter _sharedWriter = new NetDataWriter(true, 128);
 
         // Must match the key sent by the Unity client in NetManager.Connect(...)
         private const string ConnectionKey = "ArenaMMO_v1";
@@ -90,18 +93,17 @@ namespace GameServer
         /// <summary>Serialises and broadcasts a packet to every connected peer.</summary>
         public void SendToAll<T>(T packet, DeliveryMethod method) where T : class, new()
         {
-            // TODO: pool NetDataWriter instances to eliminate per-call allocation at high CCU
-            var writer = new NetDataWriter();
-            _processor.Write(writer, packet);
-            _net.SendToAll(writer, method);
+            _sharedWriter.Reset();
+            _processor.Write(_sharedWriter, packet);
+            _net.SendToAll(_sharedWriter, method);
         }
 
         /// <summary>Serialises and sends a packet to one specific peer.</summary>
         public void SendTo<T>(NetPeer peer, T packet, DeliveryMethod method) where T : class, new()
         {
-            var writer = new NetDataWriter();
-            _processor.Write(writer, packet);
-            peer.Send(writer, method);
+            _sharedWriter.Reset();
+            _processor.Write(_sharedWriter, packet);
+            peer.Send(_sharedWriter, method);
         }
 
         // ── INetEventListener ─────────────────────────────────────────────────

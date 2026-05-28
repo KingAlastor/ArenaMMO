@@ -28,6 +28,8 @@ This skill defines protocol and shared-combat invariants Copilot must preserve w
 - Do not couple packet definitions to server-only persistence concerns.
 - Do not reorder canonical ticket fields without coordinated signer/verifier updates.
 - Do not remove action sequence fields from action intent packets; replay resistance depends on them.
+- Do not revert `PlayerInputPacket.InputX`/`InputY` from `sbyte` back to `float`; this would reintroduce cross-platform FP normalization divergence between Unity and .NET runtimes.
+- Do not remove `EntityPositionPacket.ServerTick` or `AcknowledgedTick`; the Unity client depends on these for prediction reconciliation.
 
 ## Compatibility Target
 - SharedLibrary targets .NET Standard 2.1.
@@ -45,7 +47,15 @@ This skill defines protocol and shared-combat invariants Copilot must preserve w
 - If a packet transports private data, pair it with explicit visibility strategy in GameServer.
 
 ## Current Packet Invariants
-- EntityPositionPacket and EntityHealthPacket are intentionally split.
+- `PlayerInputPacket.InputX` and `InputY` are `sbyte` (range −127..127), not `float`.
+  - Both client and server dequantize via `value / 127f` — guaranteed identical math on all platforms.
+  - This eliminates per-platform FP normalization drift (ARM vs x86 auto-vectorization, FMA fusing).
+  - `sbyte` has no NaN/Inf; finite-value guards are unnecessary for these fields.
+- `EntityPositionPacket` carries two reconciliation tick fields in addition to position:
+  - `ServerTick` (int) — the server tick that produced this snapshot.
+  - `AcknowledgedTick` (int) — the last `PlayerInputPacket.TickNumber` the server consumed for this entity.
+  - The Unity client uses these to discard buffered inputs ≤ `AcknowledgedTick` and replay the remaining tail against the corrected position.
+- `EntityPositionPacket` and `EntityHealthPacket` are intentionally split.
   - Position is broadly shareable.
   - Health is a privileged stream controlled by server faction visibility.
 - Status effect lifecycle packets exist and are visibility-aware:
@@ -101,6 +111,8 @@ Do not move authoritative validation into SharedLibrary data alone; data describ
 
 ## Numeric and Enum Stability
 - Avoid changing underlying numeric values of shipped enums.
+- `PlayerInputPacket` input axes are `sbyte` by design — a protocol-breaking change to any wider type requires coordinated client/server/lobby rollout.
+- `EntityPositionPacket.ServerTick` and `AcknowledgedTick` are protocol fields; do not repurpose or remove them without a migration plan.
 - Keep float-versus-int choices intentional (simulation precision vs payload size).
 - Preserve existing packet field ordering conventions unless there is a migration plan.
 
@@ -115,6 +127,8 @@ Do not move authoritative validation into SharedLibrary data alone; data describ
 - Packet/enums remain Unity-compatible and .NET Standard 2.1-safe.
 - New fields have clear semantics and safe defaults.
 - Shared contracts still align with faction visibility and privacy constraints.
+- `PlayerInputPacket.InputX`/`InputY` remain `sbyte`; dequantization is `value / 127f`.
+- `EntityPositionPacket` still carries `ServerTick` and `AcknowledgedTick`.
 - CombatMath remains pure and allocation-free.
 - AuthTicketPacket and action intent packet changes preserve anti-replay and auth compatibility assumptions.
 

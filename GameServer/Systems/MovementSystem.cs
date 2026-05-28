@@ -18,19 +18,24 @@ namespace GameServer.Systems
             if (!player.IsAlive)
                 return;
 
-            if (!float.IsFinite(input.InputX) || !float.IsFinite(input.InputY))
-                return;
+            // Dequantize sbyte (-127..127) to float (-1..1).
+            // Both client and server apply exactly this formula, eliminating per-platform FP drift.
+            float rawX = input.InputX / 127f;
+            float rawY = input.InputY / 127f;
 
-            // Normalise so diagonal movement (|input| ≈ 1.41) cannot exceed base speed.
-            // If magnitude <= 1 (cardinal or idle), use the raw values as-is.
-            float magnitude = MathF.Sqrt(input.InputX * input.InputX + input.InputY * input.InputY);
-            if (!float.IsFinite(magnitude) || magnitude <= 0f)
-                return;
+            float magSqr = rawX * rawX + rawY * rawY;
+            if (magSqr <= 0f) return;
 
-            float normX = magnitude > 1f ? input.InputX / magnitude : input.InputX;
-            float normY = magnitude > 1f ? input.InputY / magnitude : input.InputY;
+            // Normalise only when diagonal magnitude exceeds 1 to prevent diagonal speed exploits.
+            if (magSqr > 1f)
+            {
+                float inv = 1f / MathF.Sqrt(magSqr);
+                rawX *= inv;
+                rawY *= inv;
+            }
 
-            player.Position = CombatMath.Move(player.Position, normX, normY, deltaTime);
+            player.Position = CombatMath.Move(player.Position, rawX, rawY, deltaTime);
+            player.LastProcessedClientTick = input.TickNumber;
         }
     }
 }

@@ -15,6 +15,8 @@ namespace GameServer.Systems
     {
         private const int BasicAttackCooldownTicks = 15;  // 0.5 s at 30 Hz
         private const int BasicAttackBaseDamage    = 10;
+        // Maximum ticks to rewind for hit-detection lag compensation (~333 ms at 30 Hz).
+        private const int MaxRewindTicks            = 10;
 
         // ── Public API ────────────────────────────────────────────────────────
 
@@ -28,6 +30,7 @@ namespace GameServer.Systems
             PlayerSession attacker,
             PlayerSession target,
             int currentTick,
+            int clientAttackTick,
             List<StatusEffectAppliedPacket>? statusEffects = null)
         {
             if (!attacker.IsAlive || !target.IsAlive)
@@ -42,8 +45,11 @@ namespace GameServer.Systems
             if (attacker.IsOnCooldown(0, currentTick, BasicAttackCooldownTicks))
                 return null;
 
-            // Server independently validates range — ignores any client-side shortcut
-            if (!CombatMath.IsInRange(attacker.Position, target.Position, CombatMath.MeleeRange))
+            // Validate range against the target's historical position at the tick the client attacked.
+            // This prevents penalising high-latency players whose hit was valid on their screen.
+            Vec2 targetHistoricalPos = target.GetHistoricalPosition(
+                clientAttackTick, currentTick, MaxRewindTicks);
+            if (!CombatMath.IsInRange(attacker.Position, targetHistoricalPos, CombatMath.MeleeRange))
                 return null;
 
             int  damage = CombatMath.CalculateDamage(BasicAttackBaseDamage, attacker.AttackPower, target.Armor);
@@ -70,26 +76,25 @@ namespace GameServer.Systems
         /// Routing (single-target vs AoE) is determined from the server's SpellDefinition,
         /// never from anything the client sends.
         /// </summary>
-        public static List<CombatEventPacket> ProcessSpellCast(
+        public static void ProcessSpellCast(
             PlayerSession                caster,
             SpellCastRequestPacket       request,
             SpellDefinition              spell,
             IReadOnlyList<PlayerSession> allPlayers,
             int                          currentTick,
+            List<CombatEventPacket>      results,
             List<StatusEffectAppliedPacket>? statusEffects = null)
         {
-            var results = new List<CombatEventPacket>();
-
             if (!caster.IsAlive)
-                return results;
+                return;
 
             if (caster.IsOnCooldown(spell.SpellId, currentTick, spell.CooldownTicks))
-                return results;
+                return;
 
             switch (spell.TargetType)
             {
                 case SpellTargetType.SingleTarget:
-                    ProcessSingleTarget(caster, request, spell, allPlayers, results, statusEffects);
+                    ProcessSingleTarget(caster, request, spell, allPlayers, currentTick, results, statusEffects);
                     break;
 
                 case SpellTargetType.AoE:
@@ -105,14 +110,12 @@ namespace GameServer.Systems
                 case SpellTargetType.Projectile:
                     // Projectile spells are fired via ShootRequestPacket and
                     // simulated by ProjectileSystem — they never enter the spell queue.
-                    return results;
+                    return;
             }
 
             // Cooldown is always consumed once the cast passes the alive + cooldown gate,
             // regardless of whether any target was in range. Prevents infinite spam into empty space.
             caster.SetCooldown(spell.SpellId, currentTick);
-
-            return results;
         }
 
         // ── Private Helpers ───────────────────────────────────────────────────
@@ -122,6 +125,7 @@ namespace GameServer.Systems
             SpellCastRequestPacket       request,
             SpellDefinition              spell,
             IReadOnlyList<PlayerSession> allPlayers,
+            int                          currentTick,
             List<CombatEventPacket>      results,
             List<StatusEffectAppliedPacket>? statusEffects)
         {
@@ -132,8 +136,10 @@ namespace GameServer.Systems
             if (!MatchesFactionFilter(caster, target, spell.TargetFactionFilter))
                 return;
 
-            // Server re-validates range from its own authoritative positions
-            if (!CombatMath.IsInRange(caster.Position, target.Position, spell.Range))
+            // Validate range against the target's historical position at the tick the client cast.
+            Vec2 targetHistoricalPos = target.GetHistoricalPosition(
+                request.TickNumber, currentTick, MaxRewindTicks);
+            if (!CombatMath.IsInRange(caster.Position, targetHistoricalPos, spell.Range))
                 return;
 
             ResolveHit(caster, target, spell, results, statusEffects);

@@ -11,20 +11,17 @@ namespace GameServer
     /// </summary>
     internal static class InputSanitizer
     {
-        // Allows slight analog overshoot while still rejecting clearly invalid ranges.
-        private const float MaxRawInput = 2.0f;
         // Allows a small cushion around arena bounds for targeting packets.
         private const float MaxAbsWorldCoordinate = CombatMath.ArenaBoundsHalf + 5.0f;
         // Reject absurd direction vectors before server-side normalization.
         private const float MaxAbsDirectionComponent = 1000.0f;
 
-        /// <summary>Validates movement packet shape and finite axis values.</summary>
+        /// <summary>
+        /// Validates movement packet shape.
+        /// InputX/InputY are sbyte — all values in -128..127 are finite by definition.
+        /// </summary>
         public static bool IsValid(PlayerInputPacket packet)
-            => packet.TickNumber >= 0
-               && float.IsFinite(packet.InputX)
-               && float.IsFinite(packet.InputY)
-               && MathF.Abs(packet.InputX) <= MaxRawInput
-               && MathF.Abs(packet.InputY) <= MaxRawInput;
+            => packet.TickNumber >= 0;
 
         /// <summary>Validates melee action packet shape and replay sequence field.</summary>
         public static bool IsValid(AttackRequestPacket packet)

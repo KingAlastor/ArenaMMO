@@ -29,9 +29,14 @@ namespace GameServer
 
         // ── Player State ──────────────────────────────────────────────────────
 
-        private readonly List<PlayerSession>                _players = new List<PlayerSession>();
-        private readonly Dictionary<NetPeer, PlayerSession> _peerMap = new Dictionary<NetPeer, PlayerSession>();
+        private readonly List<PlayerSession>                _players   = new List<PlayerSession>();
+        private readonly Dictionary<NetPeer, PlayerSession> _peerMap   = new Dictionary<NetPeer, PlayerSession>();
+        private readonly Dictionary<int, PlayerSession>     _entityMap = new Dictionary<int, PlayerSession>();
         private int _nextEntityId = 1;
+
+        // Reusable per-tick lists — allocated once, cleared before each use to avoid GC churn.
+        private readonly List<StatusEffectAppliedPacket> _reusableStatusEffects = new List<StatusEffectAppliedPacket>();
+        private readonly List<CombatEventPacket>          _reusableSpellEvents   = new List<CombatEventPacket>();
 
         // ── Input Queues ──────────────────────────────────────────────────────
         // Filled by network callbacks each tick; drained by ProcessTick().
@@ -117,7 +122,8 @@ namespace GameServer
             session.ReplaceAllowedSpells(context.AllowedSpellIds);
 
             _players.Add(session);
-            _peerMap[peer] = session;
+            _peerMap[peer]             = session;
+            _entityMap[session.EntityId] = session;
             _intentGuard.OnPeerConnected(peer);
             Console.WriteLine($"[Arena] Authenticated {session.PlayerName} (account={session.AccountId}, entity={session.EntityId})");
         }
@@ -128,6 +134,7 @@ namespace GameServer
             {
                 _players.Remove(session);
                 _peerMap.Remove(peer);
+                _entityMap.Remove(session.EntityId);
                 _latestInputByPeer.TryRemove(peer, out _);
                 _intentGuard.OnPeerDisconnected(peer);
                 Console.WriteLine($"[Arena] Removed {session.PlayerName} (id={session.EntityId})");
@@ -274,7 +281,9 @@ namespace GameServer
                 if (_peerMap.TryGetValue(entry.Key, out PlayerSession? player))
                     MovementSystem.ProcessInput(player, latestInput, DeltaTime);
             }
-
+            // Snapshot authoritative positions after movement for lag-compensation rewind.
+            for (int i = 0; i < _players.Count; i++)
+                _players[i].RecordPositionHistory(_tick);
             // ── 2. Melee auto-attacks ─────────────────────────────────────────
             while (_attackQueue.TryDequeue(out var entry))
             {
@@ -284,10 +293,11 @@ namespace GameServer
                 PlayerSession? target = FindById(entry.Packet.TargetEntityId);
                 if (target == null) continue;
 
-                var statusEffects = new List<StatusEffectAppliedPacket>();
-                CombatEventPacket? ev = CombatSystem.ProcessMeleeAttack(attacker, target, _tick, statusEffects);
+                _reusableStatusEffects.Clear();
+                CombatEventPacket? ev = CombatSystem.ProcessMeleeAttack(
+                    attacker, target, _tick, entry.Packet.TickNumber, _reusableStatusEffects);
                 if (ev != null) BroadcastCombatEvent(ev);
-                BroadcastStatusEffects(statusEffects);
+                BroadcastStatusEffects(_reusableStatusEffects);
             }
 
             // ── 3. Spell casts ────────────────────────────────────────────────
@@ -298,14 +308,15 @@ namespace GameServer
                 if (!caster.IsSpellAllowed(entry.Packet.SpellId)) continue;
                 if (!SpellDatabase.TryGet(entry.Packet.SpellId, out SpellDefinition spell)) continue;
 
-                var statusEffects = new List<StatusEffectAppliedPacket>();
-                List<CombatEventPacket> events =
-                    CombatSystem.ProcessSpellCast(caster, entry.Packet, spell, _players, _tick, statusEffects);
+                _reusableStatusEffects.Clear();
+                _reusableSpellEvents.Clear();
+                CombatSystem.ProcessSpellCast(
+                    caster, entry.Packet, spell, _players, _tick,
+                    _reusableSpellEvents, _reusableStatusEffects);
+                for (int evIdx = 0; evIdx < _reusableSpellEvents.Count; evIdx++)
+                    BroadcastCombatEvent(_reusableSpellEvents[evIdx]);
 
-                foreach (CombatEventPacket ev in events)
-                    BroadcastCombatEvent(ev);
-
-                BroadcastStatusEffects(statusEffects);
+                BroadcastStatusEffects(_reusableStatusEffects);
             }
 
             // ── 4. Shoot requests (spawn projectiles) ─────────────────────────────
@@ -431,9 +442,11 @@ namespace GameServer
 
                     _network.SendTo(viewer.Peer!, new EntityPositionPacket
                     {
-                        EntityId = entity.EntityId,
-                        X        = entity.Position.X,
-                        Y        = entity.Position.Y,
+                        EntityId         = entity.EntityId,
+                        X                = entity.Position.X,
+                        Y                = entity.Position.Y,
+                        ServerTick       = _tick,
+                        AcknowledgedTick = entity.LastProcessedClientTick,
                     }, DeliveryMethod.Unreliable);
 
                     if (entity.Faction == viewer.Faction)
@@ -504,10 +517,6 @@ namespace GameServer
         // ── Helpers ───────────────────────────────────────────────────────────
 
         private PlayerSession? FindById(int entityId)
-        {
-            for (int i = 0; i < _players.Count; i++)
-                if (_players[i].EntityId == entityId) return _players[i];
-            return null;
-        }
+            => _entityMap.TryGetValue(entityId, out PlayerSession? s) ? s : null;
     }
 }

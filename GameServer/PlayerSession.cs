@@ -61,6 +61,10 @@ namespace GameServer
 
         public bool IsAlive => Health > 0f;
 
+        /// <summary>The TickNumber of the last PlayerInputPacket successfully applied to this session.
+        /// Sent back to the client in EntityPositionPacket.AcknowledgedTick for reconciliation.</summary>
+        public int LastProcessedClientTick { get; set; }
+
         private readonly Dictionary<int, ActiveStatusEffect> _statusEffects = new Dictionary<int, ActiveStatusEffect>();
         private readonly List<int> _statusEffectKeysBuffer = new List<int>();
         private readonly List<int> _expiredStatusEffectIds = new List<int>();
@@ -249,6 +253,31 @@ namespace GameServer
             for (int i = 0; i < players.Count; i++)
                 if (players[i].EntityId == entityId) return players[i];
             return null;
+        }
+
+        // ── Position History (lag compensation) ─────────────────────────────────────
+        // 64 slots at 30 Hz gives ~2.1 s of rewind depth — enough to cover any realistic RTT.
+        private const int PositionHistorySize         = 64;
+        private readonly Vec2[] _positionHistory      = new Vec2[PositionHistorySize];
+
+        /// <summary>
+        /// Snapshots the current authoritative position into the ring buffer.
+        /// Called by ArenaInstance once per tick, immediately after the movement phase.
+        /// </summary>
+        public void RecordPositionHistory(int serverTick)
+        {
+            _positionHistory[serverTick % PositionHistorySize] = Position;
+        }
+
+        /// <summary>
+        /// Returns the stored position at <paramref name="requestedTick"/>, capped to
+        /// <paramref name="maxRewindTicks"/> behind <paramref name="currentTick"/>.
+        /// Always safe to call — out-of-range values are clamped to the oldest available slot.
+        /// </summary>
+        public Vec2 GetHistoricalPosition(int requestedTick, int currentTick, int maxRewindTicks)
+        {
+            int safeTick = Math.Max(requestedTick, currentTick - maxRewindTicks);
+            return _positionHistory[safeTick % PositionHistorySize];
         }
     }
 }

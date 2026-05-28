@@ -52,18 +52,20 @@ This skill defines the gameplay and networking invariants Copilot must preserve 
 ## Simulation Model
 - Fixed tick loop at 30 Hz in ArenaInstance.
 - Tick order matters and should stay stable:
-  1. Movement input
-  2. Melee attacks
-  3. Spell casts
-  4. Shoot/projectile spawn
-  5. Projectile tick and resolution
-  6. Status effect tick processing (periodic effects)
-  7. Broadcast snapshots/events
+  1. Movement input (consume latest PlayerInputPacket per peer, normalize, apply)
+  2. Record position history — call `PlayerSession.RecordPositionHistory(_tick)` on every player immediately after movement
+  3. Melee attacks
+  4. Spell casts
+  5. Shoot/projectile spawn
+  6. Projectile tick and resolution
+  7. Status effect tick processing (periodic effects)
+  8. Broadcast snapshots/events
 - Maintain deterministic, server-first sequencing wherever possible.
 
 ## Tick-Order Contract
 If a change affects one phase, validate the neighboring phases still operate correctly:
-- Movement before combat validations.
+- Movement before position history snapshot — history must capture the post-movement position.
+- Position history snapshot before combat validations — lag-compensation rewind depends on fresh history.
 - Spell/projectile spawning before projectile movement resolution.
 - Status periodic ticks after direct-hit damage resolution.
 - Snapshot broadcasts after authoritative state mutation is complete for the tick.
@@ -74,6 +76,14 @@ If a change affects one phase, validate the neighboring phases still operate cor
 - Prefer for-loops and reusable lists/buffers.
 - Avoid per-entity temporary object churn inside tick loops.
 - Keep checks branch-light and data-oriented in CombatSystem, ProjectileSystem, and ArenaInstance.
+- `ArenaInstance._entityMap` (`Dictionary<int, PlayerSession>`) provides O(1) entity lookup by EntityId.
+  - Keep it in sync with `_players` and `_peerMap` at all authentication and disconnect events.
+  - Replace any O(N) linear `FindById` scans with a dictionary lookup against `_entityMap`.
+- Reuse pre-allocated list fields `_reusableStatusEffects` and `_reusableSpellEvents` in the tick drain loops.
+  - Call `.Clear()` before each use; never allocate `new List<>()` inside per-tick or per-dequeue hot paths.
+- `NetworkManager._sharedWriter` is a single pooled `NetDataWriter` for all send calls.
+  - All sends occur on the single game-loop thread; no lock is needed.
+  - Do not allocate `new NetDataWriter()` per send call.
 
 ## Player and Faction Rules
 - Every PlayerSession has a Faction.
@@ -91,8 +101,39 @@ If a change affects one phase, validate the neighboring phases still operate cor
 - Hostile/public effects can be broadcast broadly only when intended by visibility enum.
 - New private gameplay fields must be evaluated for faction leakage risk before adding packets.
 
-## Combat Rules to Preserve
-- Melee basic attack:
+## Input Quantization Contract
+- `PlayerInputPacket.InputX` and `InputY` are `sbyte` (-127..127), not `float`.
+- Both client and server dequantize via `value / 127f` — identical math on all platforms, eliminating cross-platform FP drift.
+- Do not revert input axes to `float`; this would reintroduce normalization divergence across Unity runtimes.
+- `InputSanitizer.IsValid(PlayerInputPacket)` only checks `TickNumber >= 0`; finite-value guards are unnecessary for `sbyte`.
+
+## Reconciliation Contract
+- `EntityPositionPacket` carries two tick fields for client-side prediction reconciliation:
+  - `ServerTick` — the server tick that produced this snapshot.
+  - `AcknowledgedTick` — the last `PlayerInputPacket.TickNumber` consumed for this entity.
+- Both fields are populated in `ArenaInstance.BroadcastState` from `_tick` and `entity.LastProcessedClientTick`.
+- `PlayerSession.LastProcessedClientTick` is set by `MovementSystem.ProcessInput` on every successfully applied input.
+- Do not remove these fields; the Unity client uses them to discard stale predicted inputs and replay only the unacknowledged tail.
+
+## Lag Compensation Contract
+- `PlayerSession` holds a 64-slot `Vec2[]` position ring buffer (`_positionHistory`).
+  - 64 slots at 30 Hz ≈ 2.1 s of rewind depth — sufficient for any realistic RTT.
+  - Populated by `RecordPositionHistory(serverTick)` immediately after the movement phase each tick.
+- `GetHistoricalPosition(requestedTick, currentTick, maxRewindTicks)` returns the stored position clamped to the safe rewind window.
+- `CombatSystem.MaxRewindTicks = 10` (~333 ms) caps the rewind depth for melee and single-target spells.
+- Lag compensation applies to **melee attacks** and **single-target spells** only:
+  - `ProcessMeleeAttack` accepts `int clientAttackTick` and rewinds the target before the range check.
+  - `ProcessSingleTarget` rewinds the target using `request.TickNumber`.
+- **AoE, MeleeSplash, and projectile collision use current-tick positions** — these are spatially resolved, not instant casts.
+- Do not apply lag compensation to projectile collision; projectiles travel physically through space each tick.
+
+## CombatSystem API Contract
+- `ProcessMeleeAttack` signature includes `int clientAttackTick` — always pass `entry.Packet.TickNumber` from the attack queue.
+- `ProcessSpellCast` returns `void` and accepts an injected `List<CombatEventPacket> results`.
+  - Use the pre-allocated `_reusableSpellEvents` list from `ArenaInstance`; clear it before each call.
+  - Do not revert to a return-value `List<>` pattern.
+
+
   - Must be enemy-only.
   - Enforces cooldown and range server-side.
 - Spell casts:
@@ -146,8 +187,14 @@ If a change affects one phase, validate the neighboring phases still operate cor
 ## Review Checklist
 - Server authority still intact for all touched mechanics.
 - Faction visibility still correct for health and status effects.
-- Tick order and phase boundaries unchanged or intentionally documented.
+- Tick order and phase boundaries unchanged or intentionally documented (movement → history snapshot → combat).
+- Position history recorded every tick before combat phase.
 - No new hot-path allocations or LINQ introduced.
+- `_entityMap` kept in sync on connect and disconnect.
+- Reusable list fields cleared before each use; no per-tick `new List<>()` allocations.
+- `ProcessMeleeAttack` and `ProcessSingleTarget` still use historical position for range check.
+- `EntityPositionPacket.ServerTick` and `AcknowledgedTick` still populated in BroadcastState.
+- `PlayerInputPacket` axes remain `sbyte`; dequantization stays `value / 127f`.
 - Packet semantics are still coherent with Unity client expectations.
 - Pre-auth gating, auth timeout, and IP abuse controls still protect connection ingress.
 - IntentGuard still enforces tick skew, replay resistance, and queue pressure limits.
@@ -159,6 +206,8 @@ If a change affects one phase, validate the neighboring phases still operate cor
 - All new mechanics specify faction targeting and visibility behavior.
 - Life-steal and DoT interactions were sanity-checked for runaway sustain.
 - Any behavior change to cooldowns, targeting, or hit resolution is explicitly called out.
+- Lag-compensation rewind depth change requires review of the historical buffer size (64 slots) and `MaxRewindTicks` cap.
+- Input axis type must remain `sbyte` unless a coordinated client/server/protocol migration is planned.
 
 ## If Extending Mechanics
 When adding new mechanics, preserve these invariants:

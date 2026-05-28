@@ -55,8 +55,12 @@ namespace SharedLibrary
     public class PlayerInputPacket
     {
         public int   TickNumber { get; set; }
-        public float InputX     { get; set; }
-        public float InputY     { get; set; }
+        /// <summary>
+        /// Quantized input axis: -127..127 maps to -1..1.
+        /// Using sbyte eliminates NaN/Inf and makes client/server dequantization identical.
+        /// </summary>
+        public sbyte InputX { get; set; }
+        public sbyte InputY { get; set; }
     }
 
     /// <summary>Sent when the player performs a basic melee auto-attack.</summary>
@@ -104,9 +108,13 @@ namespace SharedLibrary
     /// <summary>Broadcast every tick with the authoritative position of one entity.</summary>
     public class EntityPositionPacket
     {
-        public int   EntityId { get; set; }
-        public float X        { get; set; }
-        public float Y        { get; set; }
+        public int   EntityId         { get; set; }
+        public float X                { get; set; }
+        public float Y                { get; set; }
+        /// <summary>The server tick that produced this snapshot. Used by the client to replay buffered inputs during reconciliation.</summary>
+        public int   ServerTick       { get; set; }
+        /// <summary>The last client TickNumber the server consumed for this entity. The client discards buffered inputs older than this before replaying.</summary>
+        public int   AcknowledgedTick { get; set; }
     }
 
     /// <summary>Broadcast only to clients that are allowed to see the entity's health.</summary>
