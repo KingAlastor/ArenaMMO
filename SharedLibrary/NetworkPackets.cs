@@ -277,4 +277,60 @@ namespace SharedLibrary
     {
         public byte WinnerFaction { get; set; }
     }
+
+    // ── Lobby Packets ─────────────────────────────────────────────────────────
+
+    /// <summary>Client → LobbyServer: authenticate with a credential token.</summary>
+    public class LobbyLoginRequestPacket
+    {
+        public string PlayerName      { get; set; } = string.Empty;
+        /// <summary>
+        /// Opaque credential token validated server-side (e.g. hashed password, JWT, Steam ticket).
+        /// Never used as a plaintext password — the lobby verifies it against its own auth scheme.
+        /// </summary>
+        public string CredentialToken { get; set; } = string.Empty;
+    }
+
+    /// <summary>LobbyServer → Client: result of the login attempt.</summary>
+    public class LobbyLoginResponsePacket
+    {
+        public bool   Success    { get; set; }
+        public int    PlayerId   { get; set; }
+        public string PlayerName { get; set; } = string.Empty;
+        public string Error      { get; set; } = string.Empty;
+    }
+
+    /// <summary>Client → LobbyServer: enter the matchmaking queue.</summary>
+    public class LobbyQueueJoinPacket
+    {
+        // Reserved for future use: preferred game mode, region, etc.
+    }
+
+    /// <summary>LobbyServer → Client: periodic queue position update.</summary>
+    public class LobbyQueueStatusPacket
+    {
+        public int QueuePosition  { get; set; }
+        public int PlayersInQueue { get; set; }
+        public int PlayersNeeded  { get; set; }
+    }
+
+    /// <summary>
+    /// LobbyServer → Client: a match has been formed.
+    /// Contains arena connection info plus all fields required to build an AuthTicketPacket.
+    /// The client connects to ArenaIp:ArenaPort and sends these fields verbatim as AuthTicketPacket.
+    /// </summary>
+    public class MatchFoundPacket
+    {
+        public string ArenaIp            { get; set; } = string.Empty;
+        public int    ArenaPort          { get; set; }
+        // AuthTicket fields — signed by the lobby, verified by the arena's AuthTicketValidator.
+        public int    PlayerId           { get; set; }
+        public string PlayerName         { get; set; } = string.Empty;
+        public byte   Faction            { get; set; }
+        public string AllowedSpellIdsCsv { get; set; } = string.Empty;
+        public long   IssuedAtUnixMs     { get; set; }
+        public long   ExpiresAtUnixMs    { get; set; }
+        public string Nonce              { get; set; } = string.Empty;
+        public string Signature          { get; set; } = string.Empty;
+    }
 }

@@ -21,8 +21,11 @@
 .vscode/
 
 # ---------- Unity (UnityClient) ----------
-# Current team mode: server/shared-first. Ignore UnityClient by default.
-UnityClient/
+# Ignore all of UnityClient except Assets/Scripts (tracked for networking/gameplay code).
+UnityClient/*
+!UnityClient/Assets/
+UnityClient/Assets/*
+!UnityClient/Assets/Scripts/
 
 # If/when you want to share Unity too, remove the line above and use these rules:
 # Keep: Assets/, Packages/, ProjectSettings/
