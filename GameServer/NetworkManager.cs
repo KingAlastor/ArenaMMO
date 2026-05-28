@@ -23,6 +23,11 @@ namespace GameServer
         private readonly ConcurrentDictionary<NetPeer, long> _pendingAuthPeers = new();
         // Lightweight per-IP abuse guard used during pre-auth connection pressure.
         private readonly ConcurrentDictionary<IPAddress, IpGuardState> _ipGuards = new();
+        // Pre-allocated to avoid per-tick heap allocation inside DisconnectAuthTimeoutPeers
+        // during connection floods. Cleared and reused every call.
+        private readonly List<NetPeer> _timedOutPeers = new List<NetPeer>();
+        // Tracks ticks between periodic _ipGuards stale-entry evictions.
+        private int _ipGuardEvictionTick;
         // Reused across every send call to eliminate per-call heap allocation.
         // All sends occur on the single game-loop thread, so no lock is required.
         private readonly NetDataWriter _sharedWriter = new NetDataWriter(true, 128);
@@ -180,29 +185,63 @@ namespace GameServer
             peer.Disconnect();
         }
 
+        // Evict _ipGuards entries every ~10 seconds (300 ticks at 30 Hz) to prevent
+        // unbounded memory growth under IPv6-spoofed unique-source-address floods.
+        private const int IpGuardEvictionIntervalTicks = 300;
+
         /// <summary>
         /// Disconnects peers that connected but never authenticated in time.
+        /// Uses a pre-allocated list to avoid per-tick heap allocations under connection floods.
         /// </summary>
         private void DisconnectAuthTimeoutPeers()
         {
+            EvictStaleIpGuards();
+
             if (_pendingAuthPeers.Count == 0)
                 return;
 
             long nowMs = Environment.TickCount64;
-            var timedOut = new List<NetPeer>();
+            _timedOutPeers.Clear();
             foreach (KeyValuePair<NetPeer, long> entry in _pendingAuthPeers)
             {
                 if (nowMs - entry.Value >= AuthTimeoutMs)
-                    timedOut.Add(entry.Key);
+                    _timedOutPeers.Add(entry.Key);
             }
 
-            for (int i = 0; i < timedOut.Count; i++)
+            for (int i = 0; i < _timedOutPeers.Count; i++)
             {
-                NetPeer peer = timedOut[i];
+                NetPeer peer = _timedOutPeers[i];
                 _pendingAuthPeers.TryRemove(peer, out _);
                 RegisterIpViolation(peer.Address, 2);
                 SecurityTelemetry.RecordInvalidTicket("auth-timeout", peer.Address);
                 peer.Disconnect();
+            }
+        }
+
+        /// <summary>
+        /// Removes _ipGuards entries for IPs that are neither currently banned nor recently active.
+        /// Prevents unbounded map growth under IPv4/IPv6 source-address exhaustion floods.
+        /// Runs at a low interval (every ~10 s) so the iteration cost is negligible.
+        /// </summary>
+        private void EvictStaleIpGuards()
+        {
+            if (++_ipGuardEvictionTick < IpGuardEvictionIntervalTicks)
+                return;
+
+            _ipGuardEvictionTick = 0;
+            long nowMs = Environment.TickCount64;
+
+            foreach (KeyValuePair<IPAddress, IpGuardState> entry in _ipGuards)
+            {
+                IpGuardState state = entry.Value;
+                bool evict;
+                lock (state.Gate)
+                {
+                    // Keep the entry if a ban is still active or if the IP has recent violations.
+                    evict = state.BannedUntilMs <= nowMs && state.ViolationScore == 0;
+                }
+                if (evict)
+                    _ipGuards.TryRemove(entry.Key, out _);
             }
         }
 

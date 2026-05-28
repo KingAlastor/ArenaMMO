@@ -311,7 +311,7 @@ namespace GameServer
                 _reusableStatusEffects.Clear();
                 _reusableSpellEvents.Clear();
                 CombatSystem.ProcessSpellCast(
-                    caster, entry.Packet, spell, _players, _tick,
+                    caster, entry.Packet, spell, _players, _entityMap, _tick,
                     _reusableSpellEvents, _reusableStatusEffects);
                 for (int evIdx = 0; evIdx < _reusableSpellEvents.Count; evIdx++)
                     BroadcastCombatEvent(_reusableSpellEvents[evIdx]);

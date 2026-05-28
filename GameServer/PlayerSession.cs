@@ -270,13 +270,23 @@ namespace GameServer
         }
 
         /// <summary>
-        /// Returns the stored position at <paramref name="requestedTick"/>, capped to
-        /// <paramref name="maxRewindTicks"/> behind <paramref name="currentTick"/>.
-        /// Always safe to call — out-of-range values are clamped to the oldest available slot.
+        /// Returns the stored position at <paramref name="requestedTick"/>, clamped to the
+        /// range [currentTick − maxRewindTicks, currentTick].
+        ///
+        /// The upper bound (currentTick) is critical: IntentGuard admits packets with up to
+        /// MaxFutureTickSkew=5 ahead of the server clock. Without the upper clamp, a future
+        /// requestedTick would index a ring-buffer slot that was last written ~(PositionHistorySize
+        /// − futureDelta) ticks ago — returning stale 2-second-old position data and producing
+        /// ghost hits or ghost misses in lag-compensation.
         /// </summary>
         public Vec2 GetHistoricalPosition(int requestedTick, int currentTick, int maxRewindTicks)
         {
-            int safeTick = Math.Max(requestedTick, currentTick - maxRewindTicks);
+            // maxRewindTicks must never exceed PositionHistorySize; the buffer only holds that many slots.
+            System.Diagnostics.Debug.Assert(
+                maxRewindTicks <= PositionHistorySize,
+                $"maxRewindTicks ({maxRewindTicks}) exceeds PositionHistorySize ({PositionHistorySize}); history will wrap.");
+
+            int safeTick = Math.Clamp(requestedTick, currentTick - maxRewindTicks, currentTick);
             return _positionHistory[safeTick % PositionHistorySize];
         }
     }

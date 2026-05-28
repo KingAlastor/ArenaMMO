@@ -84,6 +84,12 @@ If a change affects one phase, validate the neighboring phases still operate cor
 - `NetworkManager._sharedWriter` is a single pooled `NetDataWriter` for all send calls.
   - All sends occur on the single game-loop thread; no lock is needed.
   - Do not allocate `new NetDataWriter()` per send call.
+- `NetworkManager._timedOutPeers` is a pre-allocated `List<NetPeer>` reused by `DisconnectAuthTimeoutPeers()`.
+  - Do not replace it with `new List<NetPeer>()` inside the method body; that re-introduces per-tick heap allocation during connect floods.
+- `NetworkManager._ipGuards` (`ConcurrentDictionary<IPAddress, IpGuardState>`) is periodically evicted by `EvictStaleIpGuards()`.
+  - Eviction runs every `IpGuardEvictionIntervalTicks (300)` ticks (~10 s), called from `DisconnectAuthTimeoutPeers`.
+  - Only entries where the IP is neither currently banned nor carrying a nonzero violation score are removed.
+  - Do not remove this eviction path; without it an IPv6-spoofed unique-source-address flood grows the dictionary without bound.
 
 ## Player and Faction Rules
 - Every PlayerSession has a Faction.
@@ -119,7 +125,12 @@ If a change affects one phase, validate the neighboring phases still operate cor
 - `PlayerSession` holds a 64-slot `Vec2[]` position ring buffer (`_positionHistory`).
   - 64 slots at 30 Hz ≈ 2.1 s of rewind depth — sufficient for any realistic RTT.
   - Populated by `RecordPositionHistory(serverTick)` immediately after the movement phase each tick.
-- `GetHistoricalPosition(requestedTick, currentTick, maxRewindTicks)` returns the stored position clamped to the safe rewind window.
+- `GetHistoricalPosition(requestedTick, currentTick, maxRewindTicks)` clamps `requestedTick` to **both** bounds:
+  - Lower bound: `currentTick - maxRewindTicks` — prevents rewind beyond the history buffer.
+  - Upper bound: `currentTick` — **critical security invariant**: IntentGuard admits packets up to `MaxFutureTickSkew (5)` ticks ahead. Without the upper clamp, a future `requestedTick` indexes a ring-buffer slot written ~`(PositionHistorySize - delta)` ticks ago, producing ghost hits/misses from 2-second-old stale position data.
+  - Implementation uses `Math.Clamp(requestedTick, currentTick - maxRewindTicks, currentTick)`.
+  - A `Debug.Assert(maxRewindTicks <= PositionHistorySize)` guards against a future constant change silently wrapping the ring buffer.
+  - Do not revert this to `Math.Max` (lower-bound only); that re-opens the future-tick exploit.
 - `CombatSystem.MaxRewindTicks = 10` (~333 ms) caps the rewind depth for melee and single-target spells.
 - Lag compensation applies to **melee attacks** and **single-target spells** only:
   - `ProcessMeleeAttack` accepts `int clientAttackTick` and rewinds the target before the range check.
@@ -129,9 +140,12 @@ If a change affects one phase, validate the neighboring phases still operate cor
 
 ## CombatSystem API Contract
 - `ProcessMeleeAttack` signature includes `int clientAttackTick` — always pass `entry.Packet.TickNumber` from the attack queue.
-- `ProcessSpellCast` returns `void` and accepts an injected `List<CombatEventPacket> results`.
-  - Use the pre-allocated `_reusableSpellEvents` list from `ArenaInstance`; clear it before each call.
+- `ProcessSpellCast` returns `void` and accepts:
+  - `IReadOnlyList<PlayerSession> allPlayers` — used for AoE and MeleeSplash iteration.
+  - `IReadOnlyDictionary<int, PlayerSession> entityMap` — O(1) lookup for single-target resolution; always pass `ArenaInstance._entityMap`.
+  - `List<CombatEventPacket> results` — pre-allocated `_reusableSpellEvents` list; clear it before each call.
   - Do not revert to a return-value `List<>` pattern.
+  - Do not remove the `entityMap` parameter; it prevents the O(N) linear scan that a flooded spell queue can amplify into a CPU spike proportional to player count.
 
 
   - Must be enemy-only.
@@ -198,6 +212,10 @@ If a change affects one phase, validate the neighboring phases still operate cor
 - Packet semantics are still coherent with Unity client expectations.
 - Pre-auth gating, auth timeout, and IP abuse controls still protect connection ingress.
 - IntentGuard still enforces tick skew, replay resistance, and queue pressure limits.
+- `GetHistoricalPosition` still uses `Math.Clamp` with both lower AND upper bounds — do not revert to `Math.Max` (lower-bound only).
+- `DisconnectAuthTimeoutPeers` still uses the pre-allocated `_timedOutPeers` list — no per-call `new List<NetPeer>()`.
+- `_ipGuards` eviction path (`EvictStaleIpGuards`) still wired into the tick loop via `DisconnectAuthTimeoutPeers`.
+- `ProcessSpellCast` still receives `entityMap` for O(1) single-target lookup — `allPlayers` list is not the lookup path for single-target spells.
 - Security telemetry still records key drop categories for incident analysis.
 
 ## PR Gate Checklist

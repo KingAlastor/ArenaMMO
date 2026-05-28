@@ -4,6 +4,8 @@ using System.Collections.Generic;
 
 namespace GameServer.Systems
 {
+    // IReadOnlyDictionary alias for brevity inside this file.
+    using EntityMap = System.Collections.Generic.IReadOnlyDictionary<int, PlayerSession>;
     /// <summary>
     /// Server-authoritative combat resolution for melee attacks, single-target spells,
     /// and ground-targeted AoE spells.
@@ -76,11 +78,16 @@ namespace GameServer.Systems
         /// Routing (single-target vs AoE) is determined from the server's SpellDefinition,
         /// never from anything the client sends.
         /// </summary>
+        /// <param name="entityMap">
+        /// O(1) entity lookup map from ArenaInstance. Used for single-target resolution
+        /// to avoid the O(N) linear scan that a flooded spell queue can amplify into a CPU spike.
+        /// </param>
         public static void ProcessSpellCast(
             PlayerSession                caster,
             SpellCastRequestPacket       request,
             SpellDefinition              spell,
             IReadOnlyList<PlayerSession> allPlayers,
+            EntityMap                    entityMap,
             int                          currentTick,
             List<CombatEventPacket>      results,
             List<StatusEffectAppliedPacket>? statusEffects = null)
@@ -94,7 +101,7 @@ namespace GameServer.Systems
             switch (spell.TargetType)
             {
                 case SpellTargetType.SingleTarget:
-                    ProcessSingleTarget(caster, request, spell, allPlayers, currentTick, results, statusEffects);
+                    ProcessSingleTarget(caster, request, spell, entityMap, currentTick, results, statusEffects);
                     break;
 
                 case SpellTargetType.AoE:
@@ -124,12 +131,15 @@ namespace GameServer.Systems
             PlayerSession                caster,
             SpellCastRequestPacket       request,
             SpellDefinition              spell,
-            IReadOnlyList<PlayerSession> allPlayers,
+            EntityMap                    entityMap,
             int                          currentTick,
             List<CombatEventPacket>      results,
             List<StatusEffectAppliedPacket>? statusEffects)
         {
-            PlayerSession? target = FindById(allPlayers, request.TargetEntityId);
+            // O(1) dictionary lookup — the O(N) FindById scan would let a flooded spell
+            // queue amplify attacker-controlled work linearly with the player count.
+            if (!entityMap.TryGetValue(request.TargetEntityId, out PlayerSession? target))
+                return;
             if (target == null || !target.IsAlive)
                 return;
 
