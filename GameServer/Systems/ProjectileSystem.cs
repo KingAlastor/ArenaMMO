@@ -133,6 +133,9 @@ namespace GameServer.Systems
                 PierceCount       = spell.BasePierceCount + shooter.ProjectilePierceBonus,
                 // Snapshot AoE radius: > 0 means the arrow detonates on final impact
                 AoERadius         = spell.AoERadius,
+                // Snapshot damage type and pierce chance so stat changes mid-flight don't affect in-flight projectiles
+                DamageType        = spell.DamageType,
+                PierceChance      = spell.PierceChance,
                 TraveledDistance  = 0f,
             };
         }
@@ -211,11 +214,17 @@ namespace GameServer.Systems
                     if (Random.Shared.NextDouble() <= hitChance)
                     {
                         // ── HIT ───────────────────────────────────────────────────────
-                        int  damage = CombatMath.CalculateDamage(proj.BaseDamage, proj.AttackPower, target.Armor);
+                        float absorb = proj.DamageType == DamageType.Magic
+                            ? target.MagicAbsorbPercent : target.PhysicalAbsorbPercent;
+                        float resist = proj.DamageType == DamageType.Magic
+                            ? target.MagicResistPercent : target.PhysicalResistPercent;
+                        int  damage = CombatMath.CalculateDamage(
+                            proj.BaseDamage, proj.AttackPower, proj.DamageType,
+                            absorb, resist, proj.PierceChance, Random.Shared.NextDouble());
                         bool isCrit = CombatMath.IsCriticalHit(Random.Shared.NextDouble(), proj.CritChance);
                         if (isCrit) damage *= 2;
 
-                        target.ApplyDamage(damage);
+                        target.ApplyDamage(damage, proj.OwnerId);
                         ApplyLifeSteal(proj, damage, allPlayers);
                         ApplyProjectileStatusEffect(proj, target, ref statusEffects);
 
@@ -306,11 +315,17 @@ namespace GameServer.Systems
                 if (!MatchesFactionFilter(proj.TargetFactionFilter, allPlayers, proj.OwnerId, splash))
                     continue;
 
-                int  splashDmg  = CombatMath.CalculateDamage(proj.BaseDamage, proj.AttackPower, splash.Armor);
+                float splashAbsorb = proj.DamageType == DamageType.Magic
+                    ? splash.MagicAbsorbPercent : splash.PhysicalAbsorbPercent;
+                float splashResist = proj.DamageType == DamageType.Magic
+                    ? splash.MagicResistPercent : splash.PhysicalResistPercent;
+                int  splashDmg  = CombatMath.CalculateDamage(
+                    proj.BaseDamage, proj.AttackPower, proj.DamageType,
+                    splashAbsorb, splashResist, proj.PierceChance, Random.Shared.NextDouble());
                 bool splashCrit = CombatMath.IsCriticalHit(Random.Shared.NextDouble(), proj.CritChance);
                 if (splashCrit) splashDmg *= 2;
 
-                splash.ApplyDamage(splashDmg);
+                splash.ApplyDamage(splashDmg, proj.OwnerId);
                 ApplyLifeSteal(proj, splashDmg, allPlayers);
                 ApplyProjectileStatusEffect(proj, splash, ref statusEffects);
 

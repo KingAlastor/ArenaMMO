@@ -69,5 +69,12 @@ namespace SharedLibrary
         /// Stacks additively with PlayerSession.ProjectilePierceBonus from items/skills.
         /// </summary>
         public int             BasePierceCount;
+
+        /// <summary>
+        /// Probability (0–1) that this spell's hit bypasses the target's resist mitigation.
+        /// Absorb is always applied regardless of pierce. 0 = no pierce (default).
+        /// Example: 0.30 means a 30% chance to skip PhysicalResistPercent or MagicResistPercent.
+        /// </summary>
+        public float           PierceChance;
     }
 }

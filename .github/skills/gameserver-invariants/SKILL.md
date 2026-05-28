@@ -55,11 +55,14 @@ This skill defines the gameplay and networking invariants Copilot must preserve 
   1. Movement input (consume latest PlayerInputPacket per peer, normalize, apply)
   2. Record position history — call `PlayerSession.RecordPositionHistory(_tick)` on every player immediately after movement
   3. Melee attacks
-  4. Spell casts
+  4. Spell casts — drains spell queue; emits `CombatEventPacket` (via `_reusableSpellEvents`) and `AoEHitEventPacket` (via `_reusableAoEHitEvents`)
   5. Shoot/projectile spawn
   6. Projectile tick and resolution
   7. Status effect tick processing (periodic effects)
-  8. Broadcast snapshots/events
+  8. Death detection — set `IsRespawning`, increment `DeathCount`/`KillCount`, broadcast `PlayerDeathPacket`
+  9. Respawn countdown — call `TickRespawn` per player; broadcast `PlayerRespawnPacket` on return true
+  10. Win-condition check — call `CheckWinCondition()` guarded by `_matchEnded`
+  11. Broadcast snapshots/events
 - Maintain deterministic, server-first sequencing wherever possible.
 
 ## Tick-Order Contract
@@ -79,8 +82,12 @@ If a change affects one phase, validate the neighboring phases still operate cor
 - `ArenaInstance._entityMap` (`Dictionary<int, PlayerSession>`) provides O(1) entity lookup by EntityId.
   - Keep it in sync with `_players` and `_peerMap` at all authentication and disconnect events.
   - Replace any O(N) linear `FindById` scans with a dictionary lookup against `_entityMap`.
-- Reuse pre-allocated list fields `_reusableStatusEffects` and `_reusableSpellEvents` in the tick drain loops.
+  - `PlayerSession.TickStatusEffects` accepts `IReadOnlyDictionary<int, PlayerSession>` (not a list); always pass `_entityMap`.
+  - `PlayerSession` no longer contains a private static `FindById` helper; it was removed as O(N) debt.
+- Reuse pre-allocated list fields `_reusableStatusEffects`, `_reusableSpellEvents`, and `_reusableAoEHitEvents` in the tick drain loops.
   - Call `.Clear()` before each use; never allocate `new List<>()` inside per-tick or per-dequeue hot paths.
+- `RemovePlayerFromList(session)` in ArenaInstance uses an O(1) swap-remove (replace slot with last element, then `RemoveAt` tail).
+  - Do not replace it with `_players.Remove(session)` which is O(N) and shifts the entire list.
 - `NetworkManager._sharedWriter` is a single pooled `NetDataWriter` for all send calls.
   - All sends occur on the single game-loop thread; no lock is needed.
   - Do not allocate `new NetDataWriter()` per send call.
@@ -144,8 +151,10 @@ If a change affects one phase, validate the neighboring phases still operate cor
   - `IReadOnlyList<PlayerSession> allPlayers` — used for AoE and MeleeSplash iteration.
   - `IReadOnlyDictionary<int, PlayerSession> entityMap` — O(1) lookup for single-target resolution; always pass `ArenaInstance._entityMap`.
   - `List<CombatEventPacket> results` — pre-allocated `_reusableSpellEvents` list; clear it before each call.
+  - `List<AoEHitEventPacket> aoeResults` — pre-allocated `_reusableAoEHitEvents` list; clear it before each call. Used by `ProcessAoE` and `ProcessMeleeSplash`.
   - Do not revert to a return-value `List<>` pattern.
   - Do not remove the `entityMap` parameter; it prevents the O(N) linear scan that a flooded spell queue can amplify into a CPU spike proportional to player count.
+  - Do not collapse `results` and `aoeResults` into one list; single-target events and AoE events are different packet types consumed differently by clients.
 
 
   - Must be enemy-only.
@@ -191,21 +200,101 @@ If a change affects one phase, validate the neighboring phases still operate cor
 - Keep reliable/unreliable channel intent:
   - state snapshots use Unreliable latest-state style
   - combat/status lifecycle events use ReliableOrdered
+  - lifecycle events (`EntitySpawnPacket`, `EntityDespawnPacket`, `PlayerDeathPacket`, `PlayerRespawnPacket`, `MatchEndPacket`) use ReliableOrdered
+- `AoEHitEventPacket` is broadcast to all peers as ReliableOrdered, not AoI-filtered;
+  clients may be beyond view radius but still want death/SFX feedback for AoE spells.
 
 ## Safety and Persistence
 - Do not add direct SQL access into active match simulation code.
 - Match state lives in memory during simulation.
 - Preserve queue-based separation between network receive and simulation processing.
 - Preserve auth-first flow: no gameplay intent should mutate state for unauthenticated peers.
+- `MatchDataService` (in `GameServer.DataLayer`) is the only data-access layer in GameServer.
+  - `LoadPlayerProfile(accountId)` reads a Redis-cached profile synchronously **only at connection time** (outside the tick loop).
+  - `SaveMatchResultAsync(result)` is fire-and-forget; called once from `EndMatch` after `_isRunning = false`.
+  - Postgres upsert is delegated to a background `Task.Run`; the tick loop never waits for it.
+  - Do not call any `MatchDataService` method from inside `ProcessTick` or `BroadcastState`.
+- Configuration is loaded from `appsettings.json` + environment variables at startup via `Microsoft.Extensions.Configuration`.
+  - `ARENA_TICKET_SECRET` must remain in an environment variable; do not move it into `appsettings.json`.
+  - Redis and Postgres connection strings live in `appsettings.json:ConnectionStrings` and are overridable via env vars.
+  - Arena port lives in `appsettings.json:Arena:Port` (default 9050).
 
-## Review Checklist
+## Damage Pipeline Contract
+All damage resolution follows a three-stage pipeline:
+```
+raw = baseDamage × attackPower
+│
+├─ True damage → max(1, raw)  [skip absorb and resist]
+│
+└─ Physical / Magic:
+    afterAbsorb = raw × (1 − clamp(absorbPercent, 0, 1))    [absorb: always applied]
+    if (pierceRoll < pierceChance) skip resist                 [pierce: prob-based]
+    afterResist = afterAbsorb × (1 − clamp(resistPercent, 0, 1))
+    result = max(1, afterResist)
+```
+- `absorbPercent` is always applied; it cannot be bypassed (comes from armor/equipment).
+- `resistPercent` is bypassed when the pierce check succeeds (comes from stats/resistances).
+- `pierceChance` comes from `SpellDefinition.PierceChance` or `ProjectileState.PierceChance`.
+- Melee basic attacks always use `DamageType.Physical` with `pierceChance = 0f`.
+- `CombatMath.CalculateDamage` is the single authoritative implementation; do not fork it.
+- Do not mix absorb and resist semantics; they are intentionally different mitigation tiers.
+
+## PlayerSession Combat Stats Contract
+- `Armor` property was **removed**; do not re-introduce it.
+- Mitigation is now expressed as four separate float fractions (0–1):
+  - `PhysicalAbsorbPercent` — always applied to Physical hits
+  - `PhysicalResistPercent` — applied unless pierced
+  - `MagicAbsorbPercent`    — always applied to Magic hits
+  - `MagicResistPercent`    — applied unless pierced
+- These are hydrated from `PlayerProfile` (Redis) at connection time in `OnPlayerAuthenticated`.
+- Server systems select the correct pair per damage type before calling `CombatMath.CalculateDamage`.
+- `KillCount` and `DeathCount` are tracked on `PlayerSession`; incremented by ArenaInstance in phase 8.
+  - `KillCount`: credited to the entity whose `EntityId == LastKillerEntityId` on the victim.
+  - `DeathCount`: incremented on the dying session when `StartRespawn()` is called.
+  - Both are written to `MatchResult` by `EndMatch` for persistence.
+
+## Respawn Contract
+- `PlayerSession.StartRespawn()` transitions the session to respawning state.
+  - Sets `IsRespawning = true` and starts a `DefaultRespawnTicks = 150` (5 s at 30 Hz) countdown.
+  - Must only be called once per death; the phase-8 guard is `p.Health <= 0f && !p.IsRespawning`.
+- `PlayerSession.TickRespawn(Vec2 spawnPoint)` decrements the countdown each tick.
+  - Returns `true` exactly once on the tick the player re-enters play.
+  - When returning `true`, the caller broadcasts `PlayerRespawnPacket`.
+- `IsAlive` is now `Health > 0f && !IsRespawning`.
+  - Combat systems check `IsAlive` before resolving hits; a respawning player cannot be targeted.
+  - Do not revert `IsAlive` to `Health > 0f` alone; that allows combat resolution against ghosts.
+- Spawn points are faction-based static defaults: `SpawnAlpha = (-30, 0)`, `SpawnBeta = (30, 0)`.
+  - TODO in code: replace with per-map configurable spawn data when the map system is implemented.
+
+## Match Lifecycle Contract
+- `ArenaInstance` constructor signature is `ArenaInstance(string ticketSecret, MatchDataService? dataService = null)`.
+  - `dataService` is optional for unit-test contexts that don't need persistence.
+- `_matchEnded` flag gates `CheckWinCondition()` in phase 10; once true it prevents repeat end-match broadcasts.
+- `EndMatch(FactionId winner)` must:
+  1. Set `_matchEnded = true` and `_isRunning = false` (stops the tick loop).
+  2. Broadcast `MatchEndPacket` to all peers.
+  3. Fire `SaveMatchResultAsync` for each session (fire-and-forget).
+- `CheckWinCondition()` checks if all surviving players belong to a single faction (elimination rule).
+  - TODO in code: replace with objective-based win logic when map data is implemented.
+  - Does not trigger on an empty match (no living players at all) until at least one death has occurred.
+- Entity lifecycle:
+  - `OnPlayerAuthenticated`: broadcast `EntitySpawnPacket` to all connected peers; back-fill all existing entities to the new peer.
+  - `OnPlayerDisconnected`: broadcast `EntityDespawnPacket` to all remaining peers; use `RemovePlayerFromList` for O(1) removal.
+
+## ProjectileState Snapshot Contract
+- `ProjectileState` snapshots `DamageType` and `PierceChance` from the spell at spawn time.
+- These snapshots are immutable for the lifetime of the projectile.
+- Do not re-read spell stats from `SpellDatabase` during projectile tick resolution; use the snapshot.
+- This prevents a future in-flight mutation window if `SpellDatabase` ever becomes hot-reloadable.
+
+
 - Server authority still intact for all touched mechanics.
 - Faction visibility still correct for health and status effects.
-- Tick order and phase boundaries unchanged or intentionally documented (movement → history snapshot → combat).
+- Tick order and phase boundaries unchanged or intentionally documented (movement → history snapshot → combat → death → respawn → win-check → broadcast).
 - Position history recorded every tick before combat phase.
 - No new hot-path allocations or LINQ introduced.
 - `_entityMap` kept in sync on connect and disconnect.
-- Reusable list fields cleared before each use; no per-tick `new List<>()` allocations.
+- Reusable list fields cleared before each use; no per-tick `new List<>()` allocations. (Check `_reusableSpellEvents`, `_reusableAoEHitEvents`, `_reusableStatusEffects`.)
 - `ProcessMeleeAttack` and `ProcessSingleTarget` still use historical position for range check.
 - `EntityPositionPacket.ServerTick` and `AcknowledgedTick` still populated in BroadcastState.
 - `PlayerInputPacket` axes remain `sbyte`; dequantization stays `value / 127f`.
@@ -216,7 +305,14 @@ If a change affects one phase, validate the neighboring phases still operate cor
 - `DisconnectAuthTimeoutPeers` still uses the pre-allocated `_timedOutPeers` list — no per-call `new List<NetPeer>()`.
 - `_ipGuards` eviction path (`EvictStaleIpGuards`) still wired into the tick loop via `DisconnectAuthTimeoutPeers`.
 - `ProcessSpellCast` still receives `entityMap` for O(1) single-target lookup — `allPlayers` list is not the lookup path for single-target spells.
+- `ProcessSpellCast` receives both `_reusableSpellEvents` and `_reusableAoEHitEvents`; AoE/MeleeSplash fills `aoeResults`, not `results`.
 - Security telemetry still records key drop categories for incident analysis.
+- `PlayerSession.Armor` is gone; any new mitigation stat must follow the absorb/resist/pierce model.
+- `IsAlive` still includes `&& !IsRespawning`; combat systems check `IsAlive` before resolving hits.
+- `TickStatusEffects` receives `_entityMap` (`IReadOnlyDictionary<int, PlayerSession>`) — do not pass `_players` (O(N) scan).
+- `RemovePlayerFromList` is used on disconnect, not `_players.Remove(session)` (O(N) shift).
+- No `MatchDataService` methods are called from within `ProcessTick` or `BroadcastState`.
+- `ARENA_TICKET_SECRET` is read from environment, not from `appsettings.json`.
 
 ## PR Gate Checklist
 - Build succeeds for GameServer and SharedLibrary.
@@ -226,6 +322,9 @@ If a change affects one phase, validate the neighboring phases still operate cor
 - Any behavior change to cooldowns, targeting, or hit resolution is explicitly called out.
 - Lag-compensation rewind depth change requires review of the historical buffer size (64 slots) and `MaxRewindTicks` cap.
 - Input axis type must remain `sbyte` unless a coordinated client/server/protocol migration is planned.
+- Damage pipeline changes must go through `CombatMath.CalculateDamage` — no inline damage formulas in combat systems.
+- New mitigation mechanics must follow the absorb→resist→pierce ordering — do not add a fourth stage without documenting it here.
+- Match lifecycle changes (new end conditions, respawn rules) must update this skill file.
 
 ## If Extending Mechanics
 When adding new mechanics, preserve these invariants:

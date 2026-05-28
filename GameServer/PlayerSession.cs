@@ -27,7 +27,15 @@ namespace GameServer
         public float Health      { get; set; } = 100f;
         public float MaxHealth   { get; set; } = 100f;
         public float AttackPower { get; set; } = 1.0f;  // damage multiplier
-        public float Armor       { get; set; } = 0f;    // flat mitigation input
+
+        // ── Mitigation stats (0–1 fractions) ────────────────────────────────────
+        // Absorb is always applied first and cannot be bypassed.
+        // Resist is applied after absorb and is skipped when the hit is pierced.
+        public float PhysicalAbsorbPercent { get; set; } = 0f;
+        public float PhysicalResistPercent { get; set; } = 0f;
+        public float MagicAbsorbPercent    { get; set; } = 0f;
+        public float MagicResistPercent    { get; set; } = 0f;
+
         public float CritChance  { get; set; } = 0.05f; // 0–1  (5% default)
         public float MeleeLifeStealPercent { get; set; } = 0f;
 
@@ -59,7 +67,50 @@ namespace GameServer
         /// </summary>
         public int   ProjectilePierceBonus     { get; set; } = 0;
 
-        public bool IsAlive => Health > 0f;
+        public bool IsAlive => Health > 0f && !IsRespawning;
+
+        // ── Respawn ───────────────────────────────────────────────────────────────────
+        // 5 s at 30 Hz. Tune down per map when configurable map data is implemented.
+        private const int DefaultRespawnTicks = 150;
+
+        public bool IsRespawning { get; private set; }
+        private int _respawnCountdown;
+
+        /// <summary>
+        /// Transitions the session into respawn-wait immediately after death.
+        /// Called by ArenaInstance once death is detected this tick.
+        /// </summary>
+        public void StartRespawn()
+        {
+            IsRespawning      = true;
+            _respawnCountdown = DefaultRespawnTicks;
+        }
+
+        /// <summary>
+        /// Ticks the respawn countdown. When it expires, restores full health and
+        /// moves the player to <paramref name="spawnPoint"/>.
+        /// Returns true exactly once on the tick the player re-enters play.
+        /// </summary>
+        public bool TickRespawn(Vec2 spawnPoint)
+        {
+            if (!IsRespawning) return false;
+            if (--_respawnCountdown > 0) return false;
+
+            IsRespawning = false;
+            Health       = MaxHealth;
+            Position     = spawnPoint;
+            return true;
+        }
+
+        // ── Kill attribution ─────────────────────────────────────────────────────────────
+        /// <summary>EntityId of the last attacker that brought health to zero. 0 if unknown.</summary>
+        public int LastKillerEntityId { get; private set; }
+
+        /// <summary>Kills credited to this session in the current match.</summary>
+        public int KillCount  { get; set; }
+
+        /// <summary>Deaths accumulated by this session in the current match.</summary>
+        public int DeathCount { get; set; }
 
         /// <summary>The TickNumber of the last PlayerInputPacket successfully applied to this session.
         /// Sent back to the client in EntityPositionPacket.AcknowledgedTick for reconciliation.</summary>
@@ -85,10 +136,15 @@ namespace GameServer
         public void SetCooldown(int spellId, int currentTick)
             => _cooldowns[spellId] = currentTick;
 
-        public void ApplyDamage(int damage)
+        public void ApplyDamage(int damage, int killerEntityId = 0)
         {
             Health -= damage;
-            if (Health < 0f) Health = 0f;
+            if (Health <= 0f)
+            {
+                Health = 0f;
+                if (killerEntityId != 0)
+                    LastKillerEntityId = killerEntityId;
+            }
         }
 
         public bool TryApplyStatusEffect(
@@ -161,7 +217,7 @@ namespace GameServer
         }
 
         public void TickStatusEffects(
-            IReadOnlyList<PlayerSession> allPlayers,
+            IReadOnlyDictionary<int, PlayerSession> entityMap,
             List<CombatEventPacket> tickDamageEvents,
             List<StatusEffectRemovedPacket> expiredPackets)
         {
@@ -196,7 +252,7 @@ namespace GameServer
 
                     if (effect.SourceHealPercentPerTick > 0f)
                     {
-                        PlayerSession? source = FindById(allPlayers, effect.SourceEntityId);
+                        entityMap.TryGetValue(effect.SourceEntityId, out PlayerSession? source);
                         if (source != null)
                         {
                             float healAmount = dotDamage * effect.SourceHealPercentPerTick;
@@ -247,13 +303,6 @@ namespace GameServer
 
         public bool IsSpellAllowed(int spellId)
             => _allowedSpellIds.Contains(spellId);
-
-        private static PlayerSession? FindById(IReadOnlyList<PlayerSession> players, int entityId)
-        {
-            for (int i = 0; i < players.Count; i++)
-                if (players[i].EntityId == entityId) return players[i];
-            return null;
-        }
 
         // ── Position History (lag compensation) ─────────────────────────────────────
         // 64 slots at 30 Hz gives ~2.1 s of rewind depth — enough to cover any realistic RTT.

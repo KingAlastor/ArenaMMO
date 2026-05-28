@@ -1,3 +1,4 @@
+using GameServer.DataLayer;
 using GameServer.Systems;
 using LiteNetLib;
 using SharedLibrary;
@@ -44,6 +45,7 @@ namespace GameServer
         // Reusable per-tick lists — allocated once, cleared before each use to avoid GC churn.
         private readonly List<StatusEffectAppliedPacket> _reusableStatusEffects = new List<StatusEffectAppliedPacket>();
         private readonly List<CombatEventPacket>          _reusableSpellEvents   = new List<CombatEventPacket>();
+        private readonly List<AoEHitEventPacket>          _reusableAoEHitEvents  = new List<AoEHitEventPacket>();
 
         // ── Input Queues ──────────────────────────────────────────────────────
         // Filled by network callbacks each tick; drained by ProcessTick().
@@ -70,6 +72,17 @@ namespace GameServer
         private NetworkManager? _network;
         private int  _tick      = 0;
         private bool _isRunning = false;
+        private bool _matchEnded = false;
+
+        // Faction-based default spawn points.
+        // TODO: Replace with per-map configurable spawn data when the map system is implemented.
+        private static readonly Vec2 SpawnAlpha = new Vec2(-30f, 0f);
+        private static readonly Vec2 SpawnBeta  = new Vec2( 30f, 0f);
+
+        private static Vec2 GetSpawnPoint(FactionId faction)
+            => faction == FactionId.Alpha ? SpawnAlpha : SpawnBeta;
+
+        private readonly MatchDataService? _dataService;
 
         // ── Entry Point ───────────────────────────────────────────────────────
 
@@ -77,9 +90,10 @@ namespace GameServer
         /// Creates one arena runtime with a ticket validator bound to the configured signing secret.
         /// The secret is never rotated in-process; restart the server after secret changes.
         /// </summary>
-        public ArenaInstance(string ticketSecret)
+        public ArenaInstance(string ticketSecret, MatchDataService? dataService = null)
         {
             _ticketValidator = new AuthTicketValidator(ticketSecret);
+            _dataService     = dataService;
         }
 
         /// <summary>Starts the network listener and blocks on the game loop until shutdown.</summary>
@@ -122,16 +136,59 @@ namespace GameServer
                 PlayerName = context.PlayerName,
                 Peer       = peer,
                 Faction    = context.Faction,
-                Position   = Vec2.Zero,
+                Position   = GetSpawnPoint(context.Faction),
                 Health     = 100f,
                 MaxHealth  = 100f,
             };
             session.ReplaceAllowedSpells(context.AllowedSpellIds);
 
+            // Hydrate authoritative stats from the lobby-cached Redis profile when available.
+            // Falls back to session defaults above when no profile is found.
+            PlayerProfile? profile = _dataService?.LoadPlayerProfile(context.PlayerId);
+            if (profile != null)
+            {
+                session.MaxHealth             = profile.MaxHealth;
+                session.Health                = profile.MaxHealth;
+                session.AttackPower           = profile.AttackPower;
+                session.PhysicalAbsorbPercent = profile.PhysicalAbsorbPercent;
+                session.PhysicalResistPercent = profile.PhysicalResistPercent;
+                session.MagicAbsorbPercent    = profile.MagicAbsorbPercent;
+                session.MagicResistPercent    = profile.MagicResistPercent;
+                session.CritChance            = profile.CritChance;
+                session.MeleeLifeStealPercent = profile.MeleeLifeStealPercent;
+            }
+
             _players.Add(session);
-            _peerMap[peer]             = session;
+            _peerMap[peer]               = session;
             _entityMap[session.EntityId] = session;
             _intentGuard.OnPeerConnected(peer);
+
+            // Announce the new player to all currently connected peers (including the new player's
+            // own client so it can confirm its EntityId).
+            _network?.SendToAll(new EntitySpawnPacket
+            {
+                EntityId   = session.EntityId,
+                PlayerName = session.PlayerName,
+                Faction    = (byte)session.Faction,
+                X          = session.Position.X,
+                Y          = session.Position.Y,
+            }, DeliveryMethod.ReliableOrdered);
+
+            // Send every already-existing entity to the new player so their client can hydrate state.
+            // The new player is the last element; exclude it from the back-fill loop.
+            for (int i = 0; i < _players.Count - 1; i++)
+            {
+                PlayerSession existing = _players[i];
+                _network?.SendTo(peer, new EntitySpawnPacket
+                {
+                    EntityId   = existing.EntityId,
+                    PlayerName = existing.PlayerName,
+                    Faction    = (byte)existing.Faction,
+                    X          = existing.Position.X,
+                    Y          = existing.Position.Y,
+                }, DeliveryMethod.ReliableOrdered);
+            }
+
             Console.WriteLine($"[Arena] Authenticated {session.PlayerName} (account={session.AccountId}, entity={session.EntityId})");
         }
 
@@ -139,13 +196,35 @@ namespace GameServer
         {
             if (_peerMap.TryGetValue(peer, out PlayerSession? session))
             {
-                _players.Remove(session);
                 _peerMap.Remove(peer);
                 _entityMap.Remove(session.EntityId);
+                RemovePlayerFromList(session);
                 _latestInputByPeer.TryRemove(peer, out _);
                 _intentGuard.OnPeerDisconnected(peer);
+
+                // Notify remaining clients so they can despawn the disconnected entity.
+                _network?.SendToAll(new EntityDespawnPacket
+                {
+                    EntityId = session.EntityId,
+                }, DeliveryMethod.ReliableOrdered);
+
                 Console.WriteLine($"[Arena] Removed {session.PlayerName} (id={session.EntityId})");
             }
+        }
+
+        /// <summary>
+        /// O(1) swap-remove: replaces the slot with the last element, then shrinks the list by one.
+        /// Avoids the O(N) element-shift cost of <see cref="List{T}.Remove"/> for large rosters.
+        /// </summary>
+        private void RemovePlayerFromList(PlayerSession session)
+        {
+            int idx  = _players.IndexOf(session);
+            if (idx < 0) return;
+
+            int last = _players.Count - 1;
+            if (idx != last)
+                _players[idx] = _players[last];
+            _players.RemoveAt(last);
         }
 
         // ── Queue Entry Points (called from network callbacks) ────────────────
@@ -317,11 +396,14 @@ namespace GameServer
 
                 _reusableStatusEffects.Clear();
                 _reusableSpellEvents.Clear();
+                _reusableAoEHitEvents.Clear();
                 CombatSystem.ProcessSpellCast(
                     caster, entry.Packet, spell, _players, _entityMap, _tick,
-                    _reusableSpellEvents, _reusableStatusEffects);
+                    _reusableSpellEvents, _reusableAoEHitEvents, _reusableStatusEffects);
                 for (int evIdx = 0; evIdx < _reusableSpellEvents.Count; evIdx++)
                     BroadcastCombatEvent(_reusableSpellEvents[evIdx]);
+                for (int evIdx = 0; evIdx < _reusableAoEHitEvents.Count; evIdx++)
+                    BroadcastAoEHitEvent(_reusableAoEHitEvents[evIdx]);
 
                 BroadcastStatusEffects(_reusableStatusEffects);
             }
@@ -412,7 +494,7 @@ namespace GameServer
             _statusTickEvents.Clear();
             _expiredStatusEffects.Clear();
             for (int i = 0; i < _players.Count; i++)
-                _players[i].TickStatusEffects(_players, _statusTickEvents, _expiredStatusEffects);
+                _players[i].TickStatusEffects(_entityMap, _statusTickEvents, _expiredStatusEffects);
 
             if (_statusTickEvents.Count > 0)
             {
@@ -429,6 +511,50 @@ namespace GameServer
 
                 _expiredStatusEffects.Clear();
             }
+
+            // ── Phase 8: Death detection ──────────────────────────────────────────
+            for (int i = 0; i < _players.Count; i++)
+            {
+                PlayerSession p = _players[i];
+                if (p.Health <= 0f && !p.IsRespawning)
+                {
+                    p.DeathCount++;
+                    p.StartRespawn();
+
+                    // Credit the kill to the attacker if identifiable.
+                    if (p.LastKillerEntityId != 0 &&
+                        _entityMap.TryGetValue(p.LastKillerEntityId, out PlayerSession? killer))
+                    {
+                        killer.KillCount++;
+                    }
+
+                    _network?.SendToAll(new PlayerDeathPacket
+                    {
+                        KilledEntityId = p.EntityId,
+                        KillerEntityId = p.LastKillerEntityId,
+                    }, DeliveryMethod.ReliableOrdered);
+                }
+            }
+
+            // ── Phase 9: Respawn countdown ────────────────────────────────────────
+            for (int i = 0; i < _players.Count; i++)
+            {
+                PlayerSession p = _players[i];
+                if (p.TickRespawn(GetSpawnPoint(p.Faction)))
+                {
+                    _network?.SendToAll(new PlayerRespawnPacket
+                    {
+                        EntityId = p.EntityId,
+                        X        = p.Position.X,
+                        Y        = p.Position.Y,
+                        Health   = p.Health,
+                    }, DeliveryMethod.ReliableOrdered);
+                }
+            }
+
+            // ── Phase 10: Win-condition check ─────────────────────────────────────
+            if (!_matchEnded)
+                CheckWinCondition();
         }
 
         // ── Broadcast ─────────────────────────────────────────────────────────
@@ -476,6 +602,67 @@ namespace GameServer
 
         private void BroadcastCombatEvent(CombatEventPacket ev)
             => _network?.SendToAll(ev, DeliveryMethod.ReliableOrdered);
+
+        private void BroadcastAoEHitEvent(AoEHitEventPacket ev)
+            => _network?.SendToAll(ev, DeliveryMethod.ReliableOrdered);
+
+        // ── Win Condition ─────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Checks whether all living players belong to a single faction, meaning the opposing
+        /// faction has been fully eliminated.
+        /// TODO: Replace elimination check with objective-based win logic when map data is implemented.
+        /// </summary>
+        private void CheckWinCondition()
+        {
+            bool alphaAlive = false;
+            bool betaAlive  = false;
+
+            for (int i = 0; i < _players.Count; i++)
+            {
+                if (!_players[i].IsAlive) continue;
+                if (_players[i].Faction == FactionId.Alpha) alphaAlive = true;
+                else                                          betaAlive  = true;
+            }
+
+            // Wait until there is at least one dead player on a side to avoid triggering on
+            // an empty match or before anyone has died.
+            if (alphaAlive && betaAlive) return;
+            if (alphaAlive)  { EndMatch(FactionId.Alpha); return; }
+            if (betaAlive)   { EndMatch(FactionId.Beta);  return; }
+            // Everyone is dead \u2014 declare a draw by whichever faction had the last kill.
+            // For now, default to Beta winning the draw; adjust when scoring is implemented.
+            EndMatch(FactionId.Beta);
+        }
+
+        private void EndMatch(FactionId winner)
+        {
+            _matchEnded = true;
+            _isRunning  = false;
+
+            Console.WriteLine($"[Arena] Match ended. Winner: {winner}");
+
+            _network?.SendToAll(new MatchEndPacket
+            {
+                WinnerFaction = (byte)winner,
+            }, DeliveryMethod.ReliableOrdered);
+
+            // Persist results asynchronously \u2014 fire-and-forget; the tick loop has already stopped.
+            if (_dataService != null)
+            {
+                for (int i = 0; i < _players.Count; i++)
+                {
+                    PlayerSession p = _players[i];
+                    _ = _dataService.SaveMatchResultAsync(new MatchResult
+                    {
+                        AccountId  = p.AccountId,
+                        Won        = p.Faction == winner,
+                        KillCount  = p.KillCount,
+                        DeathCount = p.DeathCount,
+                    });
+                }
+            }
+        }
 
         private void BroadcastStatusEffects(IReadOnlyList<StatusEffectAppliedPacket> statusEffects)
         {

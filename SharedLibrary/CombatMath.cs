@@ -65,15 +65,44 @@ namespace SharedLibrary
         // ── Damage Formulas ───────────────────────────────────────────────────
 
         /// <summary>
-        /// Calculates effective damage after armor mitigation.
-        /// Formula: baseDamage × attackPower × (1 − armor / (armor + 100))
-        /// Minimum result is always 1.
+        /// Calculates final damage after absorb and (optionally) resist mitigation.
+        ///
+        /// Pipeline for Physical and Magic damage:
+        ///   1. raw          = baseDamage × attackPower
+        ///   2. afterAbsorb  = raw × (1 − absorbPercent)           — always applied; cannot be bypassed
+        ///   3. pierce check: if pierceRoll &lt; pierceChance → resistance step is skipped
+        ///   4. afterResist  = afterAbsorb × (1 − resistPercent)   — skipped when pierced
+        ///   5. result       = max(1, afterResist)
+        ///
+        /// True damage ignores both absorb and resist: result = max(1, baseDamage × attackPower).
+        ///
+        /// <paramref name="pierceRoll"/> must be a pre-generated value in [0, 1) from the call site
+        /// so that CombatMath remains stateless and independently testable.
         /// </summary>
-        public static int CalculateDamage(int baseDamage, float attackPower, float armor)
+        public static int CalculateDamage(
+            int        baseDamage,
+            float      attackPower,
+            DamageType damageType,
+            float      absorbPercent,
+            float      resistPercent,
+            float      pierceChance,
+            double     pierceRoll)
         {
-            float mitigation = armor / (armor + 100f);
-            float raw = baseDamage * attackPower * (1f - mitigation);
-            return (int)Math.Max(1f, raw);
+            if (!float.IsFinite(attackPower) || attackPower <= 0f)
+                attackPower = 1f;
+
+            float raw = baseDamage * attackPower;
+
+            if (damageType == DamageType.True)
+                return (int)Math.Max(1f, raw);
+
+            float afterAbsorb = raw * (1f - Clamp(absorbPercent, 0f, 1f));
+
+            bool pierced = pierceChance > 0f && pierceRoll < pierceChance;
+            if (!pierced)
+                afterAbsorb *= (1f - Clamp(resistPercent, 0f, 1f));
+
+            return (int)Math.Max(1f, afterAbsorb);
         }
 
         /// <summary>

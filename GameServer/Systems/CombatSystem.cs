@@ -54,11 +54,15 @@ namespace GameServer.Systems
             if (!CombatMath.IsInRange(attacker.Position, targetHistoricalPos, CombatMath.MeleeRange))
                 return null;
 
-            int  damage = CombatMath.CalculateDamage(BasicAttackBaseDamage, attacker.AttackPower, target.Armor);
+            int  damage = CombatMath.CalculateDamage(
+                BasicAttackBaseDamage, attacker.AttackPower,
+                DamageType.Physical,
+                target.PhysicalAbsorbPercent, target.PhysicalResistPercent,
+                pierceChance: 0f, pierceRoll: 0.0);
             bool isCrit = CombatMath.IsCriticalHit(Random.Shared.NextDouble(), attacker.CritChance);
             if (isCrit) damage *= 2;
 
-            target.ApplyDamage(damage);
+            target.ApplyDamage(damage, attacker.EntityId);
             ApplyLifeSteal(attacker, damage, attacker.MeleeLifeStealPercent);
             ApplyWeaponStatusEffect(attacker, target, statusEffects);
             attacker.SetCooldown(0, currentTick);
@@ -90,6 +94,7 @@ namespace GameServer.Systems
             EntityMap                    entityMap,
             int                          currentTick,
             List<CombatEventPacket>      results,
+            List<AoEHitEventPacket>      aoeResults,
             List<StatusEffectAppliedPacket>? statusEffects = null)
         {
             if (!caster.IsAlive)
@@ -105,13 +110,13 @@ namespace GameServer.Systems
                     break;
 
                 case SpellTargetType.AoE:
-                    ProcessAoE(caster, request, spell, allPlayers, results, statusEffects);
+                    ProcessAoE(caster, request, spell, allPlayers, aoeResults, statusEffects);
                     break;
 
                 case SpellTargetType.MeleeSplash:
                     // Caster-centred AoE — client input position is irrelevant and ignored.
                     // The server uses the authoritative caster position as the blast origin.
-                    ProcessMeleeSplash(caster, spell, allPlayers, results, statusEffects);
+                    ProcessMeleeSplash(caster, spell, allPlayers, aoeResults, statusEffects);
                     break;
 
                 case SpellTargetType.Projectile:
@@ -160,7 +165,7 @@ namespace GameServer.Systems
             SpellCastRequestPacket       request,
             SpellDefinition              spell,
             IReadOnlyList<PlayerSession> allPlayers,
-            List<CombatEventPacket>      results,
+            List<AoEHitEventPacket>      aoeResults,
             List<StatusEffectAppliedPacket>? statusEffects)
         {
             var aoECenter = new Vec2(request.AoECenterX, request.AoECenterY);
@@ -182,7 +187,7 @@ namespace GameServer.Systems
                     continue;
 
                 if (CombatMath.IsInAoE(aoECenter, spell.AoERadius, target.Position))
-                    ResolveHit(caster, target, spell, results, statusEffects);
+                    ResolveAoEHit(caster, target, spell, aoeResults, statusEffects);
             }
         }
 
@@ -190,7 +195,7 @@ namespace GameServer.Systems
             PlayerSession                caster,
             SpellDefinition              spell,
             IReadOnlyList<PlayerSession> allPlayers,
-            List<CombatEventPacket>      results,
+            List<AoEHitEventPacket>      aoeResults,
             List<StatusEffectAppliedPacket>? statusEffects)
         {
             // The AoE origin is always the caster's authoritative server position.
@@ -205,7 +210,7 @@ namespace GameServer.Systems
                     continue;
 
                 if (CombatMath.IsInAoE(caster.Position, spell.AoERadius, target.Position))
-                    ResolveHit(caster, target, spell, results, statusEffects);
+                    ResolveAoEHit(caster, target, spell, aoeResults, statusEffects);
             }
         }
 
@@ -221,14 +226,20 @@ namespace GameServer.Systems
 
             if (spell.BaseDamage > 0)
             {
-                damage = CombatMath.CalculateDamage(spell.BaseDamage, attacker.AttackPower, target.Armor);
+                float absorb = spell.DamageType == DamageType.Magic
+                    ? target.MagicAbsorbPercent : target.PhysicalAbsorbPercent;
+                float resist = spell.DamageType == DamageType.Magic
+                    ? target.MagicResistPercent : target.PhysicalResistPercent;
+                damage = CombatMath.CalculateDamage(
+                    spell.BaseDamage, attacker.AttackPower, spell.DamageType,
+                    absorb, resist, spell.PierceChance, Random.Shared.NextDouble());
                 isCrit = CombatMath.IsCriticalHit(Random.Shared.NextDouble(), attacker.CritChance);
                 if (isCrit) damage *= 2;
             }
 
             if (damage > 0)
             {
-                target.ApplyDamage(damage);
+                target.ApplyDamage(damage, attacker.EntityId);
                 ApplyLifeSteal(attacker, damage, spell.LifeStealPercent);
             }
             ApplySpellStatusEffect(attacker, target, spell, statusEffects);
@@ -239,6 +250,50 @@ namespace GameServer.Systems
                 TargetId   = target.EntityId,
                 Damage     = damage,
                 IsCritical = isCrit,
+            });
+        }
+
+        /// <summary>
+        /// Identical resolution logic to ResolveHit but emits AoEHitEventPacket,
+        /// allowing clients to group multi-target hits under a single spell VFX.
+        /// </summary>
+        private static void ResolveAoEHit(
+            PlayerSession           attacker,
+            PlayerSession           target,
+            SpellDefinition         spell,
+            List<AoEHitEventPacket> aoeResults,
+            List<StatusEffectAppliedPacket>? statusEffects)
+        {
+            int  damage = 0;
+            bool isCrit = false;
+
+            if (spell.BaseDamage > 0)
+            {
+                float absorb = spell.DamageType == DamageType.Magic
+                    ? target.MagicAbsorbPercent : target.PhysicalAbsorbPercent;
+                float resist = spell.DamageType == DamageType.Magic
+                    ? target.MagicResistPercent : target.PhysicalResistPercent;
+                damage = CombatMath.CalculateDamage(
+                    spell.BaseDamage, attacker.AttackPower, spell.DamageType,
+                    absorb, resist, spell.PierceChance, Random.Shared.NextDouble());
+                isCrit = CombatMath.IsCriticalHit(Random.Shared.NextDouble(), attacker.CritChance);
+                if (isCrit) damage *= 2;
+            }
+
+            if (damage > 0)
+            {
+                target.ApplyDamage(damage, attacker.EntityId);
+                ApplyLifeSteal(attacker, damage, spell.LifeStealPercent);
+            }
+            ApplySpellStatusEffect(attacker, target, spell, statusEffects);
+
+            aoeResults.Add(new AoEHitEventPacket
+            {
+                CasterId    = attacker.EntityId,
+                SpellId     = spell.SpellId,
+                HitEntityId = target.EntityId,
+                Damage      = damage,
+                IsCritical  = isCrit,
             });
         }
 

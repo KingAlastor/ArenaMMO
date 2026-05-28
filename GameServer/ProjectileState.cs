@@ -65,5 +65,15 @@ namespace GameServer
         /// Snapshotted at spawn: spell.BasePierceCount + shooter.ProjectilePierceBonus.
         /// </summary>
         public int   PierceCount    { get; set; }
+
+        // ── Damage type (snapshotted at spawn) ────────────────────────────────
+        /// <summary>Snapshot of SpellDefinition.DamageType at launch time.</summary>
+        public DamageType DamageType  { get; set; }
+
+        /// <summary>
+        /// Snapshot of SpellDefinition.PierceChance at launch time.
+        /// Probability (0–1) that each hit bypasses the target's resist mitigation.
+        /// </summary>
+        public float PierceChance     { get; set; }
     }
 }

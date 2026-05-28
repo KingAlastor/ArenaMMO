@@ -48,6 +48,38 @@ This skill defines protocol and shared-combat invariants Copilot must preserve w
 
 ## Current Packet Invariants
 - `PlayerInputPacket.InputX` and `InputY` are `sbyte` (range −127..127), not `float`.
+
+## Packet Catalogue
+Packets are grouped by direction and purpose.
+
+### Client → Server (intent)
+- `AuthTicketPacket` — pre-auth identity, faction, spell entitlement, HMAC signature.
+- `PlayerInputPacket` — raw movement axes (sbyte) + tick number.
+- `AttackRequestPacket` — melee attack intent + `ActionSequenceId`.
+- `SpellCastRequestPacket` — spell cast intent + AoE center + tick number + `ActionSequenceId`.
+- `ShootRequestPacket` — shoot intent + direction + `ActionSequenceId`.
+
+### Server → Client (authoritative state)
+- `EntityPositionPacket` — authoritative position + `ServerTick` + `AcknowledgedTick` for reconciliation.
+- `EntityHealthPacket` — faction-gated health update (allies only).
+- `EntitySpawnPacket` — broadcast when a player successfully authenticates and enters the arena. Fields: `EntityId`, `PlayerName`, `Faction`, `X`, `Y`.
+- `EntityDespawnPacket` — broadcast when a player disconnects. Fields: `EntityId`.
+- `CombatEventPacket` — single-target hit event (melee or single-target spell). Fields: `AttackerId`, `TargetId`, `Damage`, `IsCritical`.
+- `AoEHitEventPacket` — one packet per entity hit by an AoE or MeleeSplash spell. Fields: `CasterId`, `SpellId`, `HitEntityId`, `Damage`, `IsCritical`. Broadcast to all peers.
+- `ProjectileSpawnPacket` — authoritative projectile creation event.
+- `ProjectileDestroyPacket` — projectile removal event (hit or expiry).
+- `StatusEffectAppliedPacket` — visibility-filtered status effect application.
+- `StatusEffectRemovedPacket` — visibility-filtered status effect expiry.
+- `PlayerDeathPacket` — broadcast on kill. Fields: `KilledEntityId`, `KillerEntityId`.
+- `PlayerRespawnPacket` — broadcast when a player re-enters play after respawn timer. Fields: `EntityId`, `X`, `Y`, `Health`.
+- `MatchEndPacket` — broadcast once when win condition is met. Fields: `WinnerFaction` (byte).
+
+### Packet Design Rules
+- Do not add client-authoritative semantics to any packet contract.
+- Server→Client packets describe authoritative state — the client visualizes them, not trusts them for game logic.
+- `AoEHitEventPacket` is broadcast (not AoI-filtered) so out-of-range clients still receive kill/SFX feedback.
+- `EntitySpawnPacket` and `EntityDespawnPacket` are lifecycle signals; the Unity client drives entity creation/destruction from them.
+- `PlayerDeathPacket` and `PlayerRespawnPacket` drive the client respawn UI; the server's respawn timer is authoritative.
   - Both client and server dequantize via `value / 127f` — guaranteed identical math on all platforms.
   - This eliminates per-platform FP normalization drift (ARM vs x86 auto-vectorization, FMA fusing).
   - `sbyte` has no NaN/Inf; finite-value guards are unnecessary for these fields.
@@ -83,13 +115,14 @@ This skill defines protocol and shared-combat invariants Copilot must preserve w
 ## SpellDefinition Responsibilities
 SpellDefinition is immutable runtime input data and includes:
 - targeting and damage profile
-- projectile behavior (speed, hit radius, hit chance falloff, pierce)
+- projectile behavior (speed, hit radius, hit chance falloff, pierce count, pierce chance)
 - life-steal percentage on hit
 - optional status effect application data
 - optional periodic status effect tick model:
   - tick damage
   - tick interval
   - owner-heal percentage from each tick
+- `PierceChance` (float 0–1) — per-hit probability that the projectile or spell bypass the target's resist mitigation (absorb is never bypassed). Added alongside `BasePierceCount`.
 
 Do not move authoritative validation into SharedLibrary data alone; data describes, server enforces.
 
@@ -103,6 +136,31 @@ Do not move authoritative validation into SharedLibrary data alone; data describ
 - No hidden RNG state inside SharedLibrary.
 - Keep methods allocation-free and side-effect-free.
 - Favor methods that avoid unnecessary sqrt in hot paths where possible.
+
+## CombatMath.CalculateDamage Contract
+Current signature:
+```csharp
+public static int CalculateDamage(
+    int baseDamage, float attackPower, DamageType damageType,
+    float absorbPercent, float resistPercent,
+    float pierceChance, double pierceRoll)
+```
+Formula:
+```
+raw = baseDamage × attackPower
+True  → return max(1, raw)
+Physical/Magic:
+  afterAbsorb = raw × (1 − clamp(absorbPercent, 0, 1))
+  if (pierceRoll < pierceChance) skip resist step
+  afterResist = afterAbsorb × (1 − clamp(resistPercent, 0, 1))
+  return max(1, afterResist)
+```
+- The old `CalculateDamage(int baseDamage, float attackPower, float armor)` signature is **removed**.
+  - Do not re-introduce the flat-armor formula; it ignored damage type and was vulnerable to unintended stacking.
+- `pierceRoll` is provided by the caller from `Random.Shared.NextDouble()` so CombatMath stays RNG-free.
+- `DamageType.True` bypasses both absorb and resist; it is intended only for effects that should always deal their full value.
+- `absorbPercent` and `resistPercent` are clamped internally to [0, 1]; values outside this range are safe to pass.
+- Minimum final damage is always 1 (cannot fully absorb or resist into zero damage).
 
 ## Serialization and Stability
 - Keep packet fields primitive/simple.
@@ -131,6 +189,9 @@ Do not move authoritative validation into SharedLibrary data alone; data describ
 - `EntityPositionPacket` still carries `ServerTick` and `AcknowledgedTick`.
 - CombatMath remains pure and allocation-free.
 - AuthTicketPacket and action intent packet changes preserve anti-replay and auth compatibility assumptions.
+- `CombatMath.CalculateDamage` signature still includes `DamageType`, `absorbPercent`, `resistPercent`, `pierceChance`, `pierceRoll` — do not collapse back to flat-armor form.
+- `SpellDefinition.PierceChance` (float 0–1) and `BasePierceCount` (int) both present and semantically distinct.
+- New lifecycle packets (`EntitySpawnPacket`, `EntityDespawnPacket`, `PlayerDeathPacket`, `PlayerRespawnPacket`, `MatchEndPacket`) not repurposed for game-logic authority.
 
 ## PR Gate Checklist
 - GameServer and SharedLibrary compile after contract edits.

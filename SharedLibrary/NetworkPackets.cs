@@ -218,4 +218,63 @@ namespace SharedLibrary
         public int  ProjectileId { get; set; }
         public bool HitSomething { get; set; }
     }
+
+    // ── Entity lifecycle packets ───────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Sent to all existing peers when a new player joins the match,
+    /// and to the joining peer for each already-connected player.
+    /// The client must create and register an entity for EntityId on receipt.
+    /// </summary>
+    public class EntitySpawnPacket
+    {
+        public int    EntityId   { get; set; }
+        public string PlayerName { get; set; } = string.Empty;
+        public byte   Faction    { get; set; }
+        public float  X          { get; set; }
+        public float  Y          { get; set; }
+    }
+
+    /// <summary>
+    /// Sent to all peers when a player leaves the match permanently (disconnect).
+    /// The client must destroy the entity for EntityId on receipt.
+    /// </summary>
+    public class EntityDespawnPacket
+    {
+        public int EntityId { get; set; }
+    }
+
+    // ── Match flow packets ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Broadcast when a player's health reaches zero.
+    /// The client plays a death animation and suppresses movement input for the entity.
+    /// KillerEntityId is 0 when the kill source cannot be attributed.
+    /// </summary>
+    public class PlayerDeathPacket
+    {
+        public int KilledEntityId { get; set; }
+        public int KillerEntityId { get; set; }
+    }
+
+    /// <summary>
+    /// Broadcast when a dead player's respawn timer expires and they re-enter play.
+    /// The client repositions and plays a spawn animation.
+    /// </summary>
+    public class PlayerRespawnPacket
+    {
+        public int   EntityId { get; set; }
+        public float X        { get; set; }
+        public float Y        { get; set; }
+        public float Health   { get; set; }
+    }
+
+    /// <summary>
+    /// Broadcast once when the win condition is satisfied. WinnerFaction maps to FactionId.
+    /// The server shuts down after sending this packet.
+    /// </summary>
+    public class MatchEndPacket
+    {
+        public byte WinnerFaction { get; set; }
+    }
 }
