@@ -27,6 +27,13 @@ namespace GameServer
         private const float DeltaTime = 1f / TickRate;
         private const int   MsPerTick = 1000 / TickRate;
 
+        // Area-of-Interest replication radius. Entities beyond this distance from a viewer
+        // are not replicated, reducing O(N²) sends on large maps.
+        // 120f covers the full current arena (100×100 units, diagonal ≈ 141).
+        // Tune down for large escort/objective maps where distant players should not be visible.
+        private const float ViewRadius    = 120f;
+        private const float ViewRadiusSqr = ViewRadius * ViewRadius;
+
         // ── Player State ──────────────────────────────────────────────────────
 
         private readonly List<PlayerSession>                _players   = new List<PlayerSession>();
@@ -431,7 +438,8 @@ namespace GameServer
             if (_network == null) return;
 
             // Positions are public. Health is sent separately only to allied recipients.
-            // TODO: only send to peers within a relevant area at high player counts.
+            // Entities outside ViewRadiusSqr are skipped per viewer; own entity is always sent
+            // so client-side reconciliation (AcknowledgedTick) is never starved.
             for (int viewerIndex = 0; viewerIndex < _players.Count; viewerIndex++)
             {
                 PlayerSession viewer = _players[viewerIndex];
@@ -439,6 +447,11 @@ namespace GameServer
                 for (int entityIndex = 0; entityIndex < _players.Count; entityIndex++)
                 {
                     PlayerSession entity = _players[entityIndex];
+
+                    // Always replicate the viewer's own state; skip entities outside view radius.
+                    if (entity.EntityId != viewer.EntityId &&
+                        CombatMath.DistanceSqr(viewer.Position, entity.Position) > ViewRadiusSqr)
+                        continue;
 
                     _network.SendTo(viewer.Peer!, new EntityPositionPacket
                     {
