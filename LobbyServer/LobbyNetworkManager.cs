@@ -42,12 +42,41 @@ namespace LobbyServer
         // Cached player profile keyed by PlayerId — needed when the queue-join packet arrives
         // after the async auth task completes.
         private readonly ConcurrentDictionary<int, PlayerProfile>  _profileCache       = new();
-        // Tracks peers that have connected but not yet authenticated.
-        private readonly ConcurrentDictionary<NetPeer, byte>       _pendingAuth        = new();
+        // Tracks peers that have connected but not yet authenticated. Value = connect timestamp (ms).
+        private readonly ConcurrentDictionary<NetPeer, long>       _pendingAuth         = new();
+        // Per-peer login packet counter — disconnect after MaxLoginAttemptsPerPeer.
+        private readonly ConcurrentDictionary<NetPeer, int>        _loginAttempts       = new();
+        // Player IDs whose MatchFoundPacket has been sent — blocks re-queuing until disconnect.
+        private readonly ConcurrentDictionary<int, byte>           _dispatchedPlayerIds = new();
+        // Per-IP connection flood state for the pre-auth connection phase.
+        private readonly ConcurrentDictionary<IPAddress, LobbyIpGuardState> _ipGuards   = new();
 
         private long _lastQueueBroadcastMs;
 
         private const string ConnectionKey = "ArenaMMO_Lobby_v1";
+
+        // ── Security constants ────────────────────────────────────────────────
+        /// <summary>Max unauthenticated (pending) connections at once. Caps pre-auth memory footprint.</summary>
+        private const int MaxPendingConnections   = 512;
+        /// <summary>Milliseconds a connected peer has to send a valid login packet before being kicked.</summary>
+        private const int AuthTimeoutMs           = 8_000;
+        /// <summary>Max login packets per peer before the connection is forcibly terminated.</summary>
+        private const int MaxLoginAttemptsPerPeer = 3;
+        // Per-IP sliding-window rate limit (pre-auth connection phase only).
+        private const int MaxConnectionsPerIpWindow = 10;
+        private const int IpConnectionWindowMs      = 10_000;
+        private const int IpBanDurationMs           = 60_000;
+
+        /// <summary>Per-IP mutable state for pre-auth connection flood mitigation.</summary>
+        private sealed class LobbyIpGuardState
+        {
+            public readonly object Gate = new object();
+            public int  ConnectionCount;
+            public long WindowStartMs;
+            public long BannedUntilMs;
+
+            public LobbyIpGuardState(long nowMs) { WindowStartMs = nowMs; }
+        }
 
         public LobbyNetworkManager(
             PlayerAuthService authService,
@@ -68,7 +97,6 @@ namespace LobbyServer
 
             _net       = new NetManager(this) { AutoRecycle = true };
             _processor = new NetPacketProcessor();
-            _processor.RegisterNestedType<Vec2>();
             _processor.SubscribeReusable<LobbyLoginRequestPacket, NetPeer>(OnLoginRequest);
             _processor.SubscribeReusable<LobbyQueueJoinPacket,    NetPeer>(OnQueueJoin);
         }
@@ -85,6 +113,7 @@ namespace LobbyServer
             while (true)
             {
                 _net.PollEvents();
+                DisconnectAuthTimeoutPeers();
                 TryFormAndDispatchMatch();
                 BroadcastQueueStatusIfDue();
                 Thread.Sleep(50);   // 20 Hz coordination loop — no game simulation here
@@ -95,15 +124,32 @@ namespace LobbyServer
 
         public void OnConnectionRequest(ConnectionRequest request)
         {
-            if (request.Data.TryGetString(out string? key) && key == ConnectionKey)
-            {
-                NetPeer peer = request.Accept();
-                _pendingAuth.TryAdd(peer, 0);
-            }
-            else
+            // Reject wrong protocol key before doing any IP tracking.
+            if (!request.Data.TryGetString(out string? key) || key != ConnectionKey)
             {
                 request.Reject();
+                return;
             }
+
+            IPAddress? remoteIp = request.RemoteEndPoint?.Address;
+
+            // IP flood guard: reject rate-limited or temporarily banned source IPs.
+            if (remoteIp != null && IsIpRejected(remoteIp))
+            {
+                request.Reject();
+                return;
+            }
+
+            // Pending-auth cap: prevents memory exhaustion from connection floods.
+            if (_pendingAuth.Count >= MaxPendingConnections)
+            {
+                request.Reject();
+                return;
+            }
+
+            long    nowMs = Environment.TickCount64;
+            NetPeer peer  = request.Accept();
+            _pendingAuth.TryAdd(peer, nowMs);
         }
 
         public void OnPeerConnected(NetPeer peer)
@@ -113,11 +159,13 @@ namespace LobbyServer
         {
             Console.WriteLine($"[LobbyServer] Peer disconnected: {peer.Address} ({info.Reason})");
             _pendingAuth.TryRemove(peer, out _);
+            _loginAttempts.TryRemove(peer, out _);
 
             if (_peerPlayerMap.TryRemove(peer, out int playerId))
             {
                 _authenticatedPeers.TryRemove(playerId, out _);
                 _profileCache.TryRemove(playerId, out _);
+                _dispatchedPlayerIds.TryRemove(playerId, out _);
                 _queue.Remove(playerId);
             }
         }
@@ -145,14 +193,24 @@ namespace LobbyServer
 
         private void OnLoginRequest(LobbyLoginRequestPacket packet, NetPeer peer)
         {
+            // Only pending (unauthenticated) peers may send login packets.
             if (!_pendingAuth.ContainsKey(peer))
                 return;
 
+            // Per-peer brute-force throttle — disconnect after MaxLoginAttemptsPerPeer attempts.
+            int attempts = _loginAttempts.AddOrUpdate(peer, 1, (_, prev) => prev + 1);
+            if (attempts > MaxLoginAttemptsPerPeer)
+            {
+                peer.Disconnect();
+                return;
+            }
+
             if (string.IsNullOrWhiteSpace(packet.PlayerName) || packet.PlayerName.Length > 24
-                || string.IsNullOrWhiteSpace(packet.CredentialToken))
+                || string.IsNullOrWhiteSpace(packet.CredentialToken) || packet.CredentialToken.Length > 512)
             {
                 Send(peer, new LobbyLoginResponsePacket { Success = false, Error = "invalid-request-shape" });
-                peer.Disconnect();
+                if (attempts >= MaxLoginAttemptsPerPeer)
+                    peer.Disconnect();
                 return;
             }
 
@@ -172,10 +230,27 @@ namespace LobbyServer
                     return;
                 }
 
-                _pendingAuth.TryRemove(capturedPeer, out _);
-                _profileCache[profile.AccountId]     = profile;
-                _authenticatedPeers[profile.AccountId] = capturedPeer;
-                _peerPlayerMap[capturedPeer]           = profile.AccountId;
+                // Atomic single-occupancy guard: prevents two simultaneous auth Tasks for the
+                // same player ID from both succeeding (duplicate / double-login attack).
+                if (!_authenticatedPeers.TryAdd(profile.AccountId, capturedPeer))
+                {
+                    Send(capturedPeer, new LobbyLoginResponsePacket { Success = false, Error = "already-connected" });
+                    capturedPeer.Disconnect();
+                    return;
+                }
+
+                // Use _pendingAuth.TryRemove as the completion handshake.
+                // If it returns false, the peer disconnected (or timed out) while the DB call
+                // was in-flight. Roll back the auth entry to prevent ghost state.
+                if (!_pendingAuth.TryRemove(capturedPeer, out _))
+                {
+                    _authenticatedPeers.TryRemove(profile.AccountId, out _);
+                    return;
+                }
+
+                _loginAttempts.TryRemove(capturedPeer, out _);
+                _profileCache[profile.AccountId] = profile;
+                _peerPlayerMap[capturedPeer]      = profile.AccountId;
 
                 Send(capturedPeer, new LobbyLoginResponsePacket
                 {
@@ -196,6 +271,10 @@ namespace LobbyServer
                 // Not authenticated yet — reject silently.
                 return;
             }
+
+            // State machine guard: prevent re-queuing after a MatchFoundPacket was already sent.
+            if (_dispatchedPlayerIds.ContainsKey(playerId))
+                return;
 
             _queue.Enqueue(new QueuedPlayer(playerId, profile.PlayerName, profile.AllowedSpellIdsCsv, peer));
 
@@ -245,6 +324,7 @@ namespace LobbyServer
                 });
 
                 playerIds.Add(player.PlayerId);
+                _dispatchedPlayerIds[player.PlayerId] = 0;
                 Console.WriteLine($"  → Ticket issued: {player.PlayerName} (faction={player.Faction})");
             }
 
@@ -295,6 +375,61 @@ namespace LobbyServer
                     PlayersInQueue = total,
                     PlayersNeeded  = needed,
                 });
+            }
+        }
+
+        // ── Security helpers ────────────────────────────────────────────────
+
+        /// <summary>
+        /// Disconnects peers that connected but never authenticated within AuthTimeoutMs.
+        /// Called every coordination tick to prevent ghost connections from accumulating.
+        /// </summary>
+        private void DisconnectAuthTimeoutPeers()
+        {
+            if (_pendingAuth.IsEmpty)
+                return;
+
+            long nowMs = Environment.TickCount64;
+            foreach (KeyValuePair<NetPeer, long> entry in _pendingAuth)
+            {
+                if (nowMs - entry.Value >= AuthTimeoutMs)
+                {
+                    Console.WriteLine($"[LobbyServer] Auth timeout — disconnecting {entry.Key.Address}");
+                    _pendingAuth.TryRemove(entry.Key, out _);
+                    _loginAttempts.TryRemove(entry.Key, out _);
+                    entry.Key.Disconnect();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Returns true when an IP should be rejected due to an active ban or exceeded rate limit.
+        /// Applies a sliding-window connection counter and escalates to a temporary ban on violation.
+        /// </summary>
+        private bool IsIpRejected(IPAddress ip)
+        {
+            long nowMs = Environment.TickCount64;
+            LobbyIpGuardState state = _ipGuards.GetOrAdd(ip, _ => new LobbyIpGuardState(nowMs));
+
+            lock (state.Gate)
+            {
+                if (state.BannedUntilMs > nowMs)
+                    return true;
+
+                // Reset the sliding window when it expires.
+                if (nowMs - state.WindowStartMs >= IpConnectionWindowMs)
+                {
+                    state.WindowStartMs   = nowMs;
+                    state.ConnectionCount = 0;
+                }
+
+                state.ConnectionCount++;
+                if (state.ConnectionCount <= MaxConnectionsPerIpWindow)
+                    return false;
+
+                state.BannedUntilMs = nowMs + IpBanDurationMs;
+                Console.WriteLine($"[LobbyServer] IP rate-limit ban applied: {ip}");
+                return true;
             }
         }
 

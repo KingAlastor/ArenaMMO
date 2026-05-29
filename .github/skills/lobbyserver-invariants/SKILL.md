@@ -37,9 +37,11 @@ This skill defines the authentication, matchmaking, and ticket-issuance invarian
 
 ## Authentication Contract
 - `PlayerAuthService` is the only code path that touches the `players` table for credential verification.
-- Input validation (name length ≤ 24, non-empty token) must happen before any database call.
-- Credential verification is intentionally a placeholder — replace with bcrypt, JWT, or Steam session ticket verification; do not ship the placeholder in production.
-- DB connections open and close per-call (no connection pooling at this layer). This is intentional for simplicity; revisit if lobby scale requires it.
+- Input validation (name length ≤ 24, token length ≤ 512, non-empty) must happen before any database call.
+- Credentials are verified with **BCrypt.Net-Next** (`BCrypt.Net.BCrypt.Verify`). The `players` table must have a `password_hash` column storing a bcrypt hash with cost ≥ 12.
+- A static `_bcryptDummyHash` is pre-computed once at startup. When a username does not exist in the database, `BCrypt.Verify` is still called against the dummy hash so both paths take the same wall-clock time. **Do not remove this timing-equalization step** — it prevents username enumeration via response-time measurement.
+- The `password_hash` column is selected into the private `PlayerDbRow` record, which never leaves `PlayerAuthService`. `PlayerProfile` (the public return type) does not carry any hash.
+- For Steam/JWT auth: swap the Npgsql query and the `BCrypt.Verify` call; keep the dummy-hash timing equalization pattern.
 - Failed authentication must:
   1. Send `LobbyLoginResponsePacket { Success = false, Error = "<reason>" }`.
   2. Immediately disconnect the peer.
@@ -51,17 +53,44 @@ This skill defines the authentication, matchmaking, and ticket-issuance invarian
 - `MatchmakingQueue` is the only code that assigns factions (`FactionId.Alpha` / `FactionId.Beta`).
 - Match size must be a positive even number (first half → Alpha, second half → Beta).
 - A player re-queuing (e.g. after network drop) replaces their prior queue entry — not duplicated.
-- Players removed from the queue (disconnect) must also be cleaned from `_authenticatedPeers`, `_peerPlayerMap`, and `_profileCache` in `LobbyNetworkManager.OnPeerDisconnected`.
+- Players removed from the queue (disconnect) must also be cleaned from `_authenticatedPeers`, `_peerPlayerMap`, `_profileCache`, and `_dispatchedPlayerIds` in `LobbyNetworkManager.OnPeerDisconnected`.
 - `TryFormMatch` is called from the coordination loop thread; it holds the queue lock only for the atomic dequeue. Do not perform I/O or blocking calls under the lock.
+- Once `TryFormAndDispatchMatch` sends a `MatchFoundPacket` for a player, their `PlayerId` is added to `_dispatchedPlayerIds`. Any subsequent `LobbyQueueJoinPacket` from that peer must be silently dropped. **Do not remove this guard** — without it, a player can re-enter the queue while simultaneously connecting to the arena.
 
 ---
 
 ## Network & Security Guardrails
-- Peers that connect but do not complete login within a reasonable time should be disconnected. Consider adding an auth-timeout similar to the arena's `AuthTimeoutMs`.
-- All inbound packets from peers not yet in `_peerPlayerMap` (i.e., unauthenticated) must be silently discarded or rejected with disconnect.
+
+### Connection Flood Defense
+- `OnConnectionRequest` runs three ordered rejection checks before calling `request.Accept()`:
+  1. **Protocol key** — reject wrong key immediately, before IP tracking.
+  2. **IP rate limit** (`LobbyIpGuardState`) — per-IP sliding window (`MaxConnectionsPerIpWindow = 10` per 10 s); violation applies a `IpBanDurationMs = 60 000 ms` temporary ban.
+  3. **Pending-auth cap** — reject if `_pendingAuth.Count >= MaxPendingConnections (512)`. This caps pre-auth RAM footprint under floods.
+- Do not reorder or skip these three checks.
+- `_pendingAuth` stores the connect timestamp (`long`) for each unauthenticated peer, not a sentinel byte.
+
+### Auth Timeout (Ghost Connection Prevention)
+- `DisconnectAuthTimeoutPeers()` is called every coordination tick (before `TryFormAndDispatchMatch`).
+- Peers that have not completed authentication within `AuthTimeoutMs = 8 000 ms` are forcibly disconnected and removed from `_pendingAuth` and `_loginAttempts`.
+- Do not remove or bypass this — without it, connection floods leave permanent ghost entries in `_pendingAuth`.
+
+### Per-Peer Login Throttle
+- `_loginAttempts` tracks the count of `LobbyLoginRequestPacket` per peer.
+- After `MaxLoginAttemptsPerPeer = 3` attempts, the peer is disconnected **before** spawning a DB task.
+- This prevents credential-stuffing attacks from saturating the PostgreSQL connection pool.
+
+### Double-Login Race Condition Guard
+- `OnLoginRequest` uses `_authenticatedPeers.TryAdd` (not `[]=`) as an atomic single-occupancy check after the async DB call completes.
+- If `TryAdd` returns `false`, another session for the same `PlayerId` is already active; send `"already-connected"` and disconnect.
+- After `TryAdd` succeeds, call `_pendingAuth.TryRemove(peer, out _)` as a **completion handshake**. If it returns `false`, the peer disconnected or timed out during the DB call; roll back `_authenticatedPeers.TryRemove` and return without writing to `_peerPlayerMap`. This prevents ghost entries from the async race.
+- Do not use `_authenticatedPeers[id] = peer` (direct assignment) — it silently overwrites an existing session.
+
+### General Packet Rules
+- All inbound packets from peers not yet in `_peerPlayerMap` (i.e., unauthenticated) must be silently discarded.
 - Never trust `PlayerName`, `Faction`, or `AllowedSpellIdsCsv` values from the client. Always source them from the database profile loaded during authentication.
 - `OnLoginRequest` uses `Task.Run` for async DB access. The captured variables (`capturedPeer`, `capturedName`, `capturedToken`) must be immutable snapshots — never capture mutable shared state.
 - `Send<T>()` allocates a new `NetDataWriter` per call. This is acceptable in the lobby (low-frequency); do not replicate this pattern in the arena's hot loop.
+- Do not call `_processor.RegisterNestedType<Vec2>()` in `LobbyNetworkManager`. No lobby packet uses `Vec2`, and `Vec2` does not implement `INetSerializable` — this causes a compile error in LiteNetLib 2.x.
 
 ---
 
@@ -91,11 +120,15 @@ This skill defines the authentication, matchmaking, and ticket-issuance invarian
 
 ## Do
 - Keep `TicketIssuer` and `AuthTicketValidator` in strict canonical-order parity.
-- Validate all client-supplied strings (name length, non-empty token) at the boundary before any downstream use.
+- Validate all client-supplied strings (name length ≤ 24, token length ≤ 512, non-empty) at the boundary before any downstream use.
 - Source `AllowedSpellIdsCsv` exclusively from the database profile.
 - Keep faction assignment inside `MatchmakingQueue.TryFormMatch` only.
 - Keep Redis publish failures non-fatal to the match dispatch path.
 - Keep the Unity client's role purely passive: receive ticket, forward to arena.
+- Always use `_authenticatedPeers.TryAdd` (not `[]=`) when registering a new session after auth.
+- Always call `_pendingAuth.TryRemove` as the completion handshake after `TryAdd` succeeds; roll back on `false`.
+- Always run the BCrypt dummy-hash timing-equalization branch when a username is not found.
+- Always clear `_dispatchedPlayerIds` for a player in `OnPeerDisconnected`.
 
 ## Don't
 - Do not let the client supply or influence `AllowedSpellIdsCsv`, `Faction`, or `PlayerId`.
@@ -106,6 +139,12 @@ This skill defines the authentication, matchmaking, and ticket-issuance invarian
 - Do not add SQL queries to the lobby coordination loop. DB access belongs in `PlayerAuthService` only, triggered by login.
 - Do not allow unauthenticated peers to trigger matchmaking or queue operations.
 - Do not have the Unity client construct, modify, or sign an `AuthTicketPacket` itself.
+- Do not use `_authenticatedPeers[id] = peer` (direct assignment) — use `TryAdd` to prevent silent session takeover.
+- Do not remove the `_pendingAuth.TryRemove` completion handshake — it is the rollback gate for the async double-login race.
+- Do not remove `DisconnectAuthTimeoutPeers()` from the coordination loop — it is the only ghost-connection defence.
+- Do not remove the `_dispatchedPlayerIds` check in `OnQueueJoin` — it prevents post-dispatch state machine re-entry.
+- Do not remove the BCrypt dummy-hash branch in `PlayerAuthService` — it prevents username enumeration via timing.
+- Do not call `RegisterNestedType<Vec2>()` in the lobby's `NetPacketProcessor` — no lobby packet uses `Vec2`.
 
 ---
 
@@ -114,9 +153,9 @@ This skill defines the authentication, matchmaking, and ticket-issuance invarian
 LobbyServer/
   Program.cs               — Entry point; reads ARENA_TICKET_SECRET from env
   appsettings.json         — Non-secret config (ports, match size, Redis/Postgres strings)
-  LobbyServer.csproj       — Net7.0; refs SharedLibrary, LiteNetLib, Dapper, Npgsql, Redis
+  LobbyServer.csproj       — Net7.0; refs SharedLibrary, LiteNetLib, Dapper, Npgsql, Redis, BCrypt.Net-Next
   TicketIssuer.cs          — HMAC-SHA256 signing; canonical field order is protocol contract
-  PlayerAuthService.cs     — Postgres credential lookup via Dapper
+  PlayerAuthService.cs     — Postgres credential lookup via Dapper; BCrypt.Net-Next verification; timing-equalization dummy hash
   MatchmakingQueue.cs      — Thread-safe FIFO; faction assignment on match formation
   LobbyNetworkManager.cs   — LiteNetLib UDP listener; 20 Hz coordination loop
 

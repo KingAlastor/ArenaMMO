@@ -1,6 +1,7 @@
 using Dapper;
 using Npgsql;
 using System;
+using System.Security.Cryptography;
 using System.Threading.Tasks;
 
 namespace LobbyServer
@@ -13,6 +14,12 @@ namespace LobbyServer
     {
         private readonly string _connectionString;
 
+        // Pre-computed dummy hash used in timing-equalization when the queried username does not
+        // exist. Without this, an attacker can distinguish valid vs. invalid usernames by
+        // measuring how long the server takes to respond (no BCrypt work vs. full BCrypt work).
+        private static readonly string _bcryptDummyHash =
+            BCrypt.Net.BCrypt.HashPassword(Convert.ToHexString(RandomNumberGenerator.GetBytes(16)));
+
         public PlayerAuthService(string connectionString)
         {
             if (string.IsNullOrWhiteSpace(connectionString))
@@ -22,48 +29,53 @@ namespace LobbyServer
         }
 
         /// <summary>
-        /// Looks up the player profile by name and validates the credential token.
-        /// Returns null when authentication fails (player not found or bad token).
+        /// Looks up the player by display name and verifies the bcrypt credential.
+        /// Returns null when authentication fails (player not found or wrong password).
+        /// Runs constant-time BCrypt.Verify even when the username is not found to prevent
+        /// timing-based username enumeration.
         /// </summary>
-        /// <param name="playerName">Display name submitted by the client.</param>
-        /// <param name="credentialToken">
-        /// Opaque token (e.g. bcrypt-hashed password, Steam session ticket, JWT sub).
-        /// Replace the placeholder comparison below with your actual auth scheme.
-        /// </param>
         public async Task<PlayerProfile?> TryAuthenticateAsync(string playerName, string credentialToken)
         {
-            // Input guard — never send unsanitized strings into SQL params even via parameterisation.
-            if (string.IsNullOrWhiteSpace(playerName) || playerName.Length > 24)
+            if (string.IsNullOrWhiteSpace(playerName) || playerName.Length > 24
+                || string.IsNullOrWhiteSpace(credentialToken) || credentialToken.Length > 512)
                 return null;
 
             await using var conn = new NpgsqlConnection(_connectionString);
             await conn.OpenAsync();
 
-            // TODO: Replace the credential_token column check with your actual auth scheme.
-            // Example schemes:
-            //   - bcrypt: fetch password_hash, then BCrypt.Net.BCrypt.Verify(credentialToken, hash)
-            //   - JWT:    validate JWT signature, extract sub == playerId
-            //   - Steam:  call Steam Web API to validate the session ticket
-            var profile = await conn.QueryFirstOrDefaultAsync<PlayerProfile>(
+            // Fetch the raw DB row including the stored bcrypt hash.
+            // NOTE: The players table must have a password_hash column (bcrypt, cost ≥ 12).
+            //       For Steam/JWT auth: swap this query and the Verify call below accordingly.
+            var row = await conn.QueryFirstOrDefaultAsync<PlayerDbRow>(
                 @"SELECT id                AS AccountId,
                          display_name      AS PlayerName,
-                         allowed_spell_ids AS AllowedSpellIdsCsv
+                         allowed_spell_ids AS AllowedSpellIdsCsv,
+                         password_hash     AS PasswordHash
                   FROM   players
                   WHERE  display_name = @name
                   LIMIT  1",
                 new { name = playerName });
 
-            if (profile is null)
+            // Always call BCrypt.Verify regardless of whether the row was found.
+            // When the row is missing we verify against _bcryptDummyHash so the call
+            // takes the same wall-clock time, preventing username enumeration.
+            string hashToVerify    = row?.PasswordHash ?? _bcryptDummyHash;
+            bool   credentialValid = BCrypt.Net.BCrypt.Verify(credentialToken, hashToVerify);
+
+            if (row is null || !credentialValid)
                 return null;
 
-            // Placeholder token check — swap for a real scheme (see TODO above).
-            if (string.IsNullOrWhiteSpace(credentialToken))
-                return null;
-
-            return profile;
+            return new PlayerProfile(row.AccountId, row.PlayerName, row.AllowedSpellIdsCsv);
         }
 
         public void Dispose() { /* connections are opened and closed per-call */ }
+
+        // Raw DB row — includes the bcrypt hash, which must never leave this class.
+        private sealed record PlayerDbRow(
+            int    AccountId,
+            string PlayerName,
+            string AllowedSpellIdsCsv,
+            string PasswordHash);
     }
 
     /// <summary>Immutable player profile loaded from the database after successful authentication.</summary>
