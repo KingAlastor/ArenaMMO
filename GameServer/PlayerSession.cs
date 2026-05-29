@@ -1,5 +1,7 @@
 using SharedLibrary;
 using LiteNetLib;
+using GameServer.DataLayer;
+using System;
 using System.Collections.Generic;
 
 namespace GameServer
@@ -67,6 +69,244 @@ namespace GameServer
         /// </summary>
         public int   ProjectilePierceBonus     { get; set; } = 0;
 
+        // ── Base stats (pre-equipment) ────────────────────────────────────────────
+        // Set once from PlayerProfile at connect time; never mutated mid-match.
+        // Equipment bonuses are layered on top in RecomputeStats().
+        private float _baseMaxHealth;
+        private float _baseAttackPower;
+        private float _basePhysicalAbsorbPercent;
+        private float _basePhysicalResistPercent;
+        private float _baseMagicAbsorbPercent;
+        private float _baseMagicResistPercent;
+        private float _baseCritChance;
+        private float _baseMeleeLifeStealPercent;
+
+        // ── Inventory and equipped items ──────────────────────────────────────────
+        // Inventory is the ownership source of truth; equipping an item not present
+        // here is rejected server-side, preventing clients from granting themselves items.
+        private readonly List<ItemInstance>                   _inventory     = new List<ItemInstance>();
+        private readonly Dictionary<EquipSlot, ItemInstance>  _equippedItems = new Dictionary<EquipSlot, ItemInstance>();
+
+        /// <summary>Up to 2 preset gear set loadouts, hydrated from Redis at connect time.</summary>
+        public GearSetLoadout[] GearSets           { get; private set; } = Array.Empty<GearSetLoadout>();
+        public int               ActiveGearSetIndex { get; private set; } = 0;
+
+        /// <summary>
+        /// Populates base stats, inventory, and gear set loadouts from the Redis-cached profile.
+        /// Applies GearSets[0] as the starting loadout and sets Health to the resulting MaxHealth.
+        /// Must be called once after the session is created, before the first game tick.
+        /// </summary>
+        public void HydrateFromProfile(PlayerProfile profile)
+        {
+            _baseMaxHealth             = profile.BaseMaxHealth;
+            _baseAttackPower           = profile.BaseAttackPower;
+            _basePhysicalAbsorbPercent = profile.BasePhysicalAbsorbPercent;
+            _basePhysicalResistPercent = profile.BasePhysicalResistPercent;
+            _baseMagicAbsorbPercent    = profile.BaseMagicAbsorbPercent;
+            _baseMagicResistPercent    = profile.BaseMagicResistPercent;
+            _baseCritChance            = profile.BaseCritChance;
+            _baseMeleeLifeStealPercent = profile.BaseMeleeLifeStealPercent;
+
+            _inventory.Clear();
+            for (int i = 0; i < profile.Inventory.Length; i++)
+                _inventory.Add(profile.Inventory[i]);
+
+            GearSets = profile.GearSets;
+
+            // Apply the first gear set as the starting loadout, or compute from base stats alone.
+            if (GearSets.Length > 0)
+                ApplyGearSetLoadout(0);
+            else
+                RecomputeStats();
+
+            Health = MaxHealth;
+        }
+
+        /// <summary>
+        /// Quickswap to a preset gear set. All items are validated against the player's
+        /// inventory — the client cannot activate a loadout with items it doesn't own.
+        /// </summary>
+        public bool TryApplyGearSet(int setIndex, out PlayerStatsRefreshedPacket packet)
+        {
+            packet = null!;
+            if (setIndex < 0 || setIndex >= GearSets.Length) return false;
+
+            ApplyGearSetLoadout(setIndex);
+            packet = BuildStatsPacket();
+            return true;
+        }
+
+        /// <summary>
+        /// Equips a single item from the player's inventory into its designated slot.
+        /// The slot is derived from the item's definition — the client cannot reassign slots.
+        /// Immediately calls <see cref="RecomputeStats"/> so the new stat total is authoritative.
+        /// </summary>
+        public bool TryEquipItem(int instanceId, out PlayerStatsRefreshedPacket packet)
+        {
+            packet = null!;
+            if (instanceId <= 0) return false;
+
+            ItemInstance? item = FindInInventory(instanceId);
+            if (item == null) return false;  // not in this player's inventory — ownership check
+
+            if (!ItemDatabase.TryGet(item.DefinitionId, out ItemDefinition def)) return false;
+
+            _equippedItems[def.Slot] = item;
+            RecomputeStats();
+            packet = BuildStatsPacket();
+            return true;
+        }
+
+        /// <summary>Clears the specified equipment slot and recomputes stats.</summary>
+        public bool TryUnequipSlot(EquipSlot slot, out PlayerStatsRefreshedPacket packet)
+        {
+            packet = null!;
+
+            _equippedItems.Remove(slot);
+            RecomputeStats();
+            packet = BuildStatsPacket();
+            return true;
+        }
+
+        private void ApplyGearSetLoadout(int setIndex)
+        {
+            GearSetLoadout loadout = GearSets[setIndex];
+            _equippedItems.Clear();
+
+            foreach (KeyValuePair<int, int> entry in loadout.SlotItems)
+            {
+                var slot = (EquipSlot)entry.Key;
+                ItemInstance? item = FindInInventory(entry.Value);
+                if (item != null)
+                    _equippedItems[slot] = item;
+            }
+
+            ActiveGearSetIndex = setIndex;
+            RecomputeStats();
+        }
+
+        private void RecomputeStats()
+        {
+            // Preserve health as a percentage of the old MaxHealth so that equipping an item
+            // that adds +50 MaxHP also raises current health by 50 (and removing it lowers it).
+            // Only apply proportional scaling when there is a valid prior MaxHealth to divide by.
+            float oldMaxHealth = MaxHealth;
+
+            float maxHp      = _baseMaxHealth;
+            float atkPower   = _baseAttackPower;
+            float physAbsorb = _basePhysicalAbsorbPercent;
+            float physResist = _basePhysicalResistPercent;
+            float magAbsorb  = _baseMagicAbsorbPercent;
+            float magResist  = _baseMagicResistPercent;
+            float crit       = _baseCritChance;
+            float lifeSteal  = _baseMeleeLifeStealPercent;
+            float projRange  = 1.0f;
+            int   projPierce = 0;
+
+            // Layer 1: equipped item bonuses.
+            foreach (KeyValuePair<EquipSlot, ItemInstance> kvp in _equippedItems)
+            {
+                // CraftedStats takes priority over the archetype base stats.
+                // If neither is available (unknown definition), skip the item.
+                ItemStatModifiers? m = kvp.Value.CraftedStats;
+                if (m == null)
+                {
+                    if (!ItemDatabase.TryGet(kvp.Value.DefinitionId, out ItemDefinition def)) continue;
+                    m = def.Stats;
+                }
+
+                maxHp      += m.MaxHealth;
+                atkPower   += m.AttackPower;
+                physAbsorb += m.PhysicalAbsorbPercent;
+                physResist += m.PhysicalResistPercent;
+                magAbsorb  += m.MagicAbsorbPercent;
+                magResist  += m.MagicResistPercent;
+                crit       += m.CritChance;
+                lifeSteal  += m.MeleeLifeStealPercent;
+                projRange  += m.ProjectileRangeBonus;
+                projPierce += m.ProjectilePierceBonus;
+            }
+
+            // Layer 2: active status-effect stat modifiers (buffs / debuffs / consumables).
+            // These are temporary and recalculated whenever an effect is applied or expires.
+            foreach (KeyValuePair<int, ActiveStatusEffect> kvp in _statusEffects)
+            {
+                StatModifier m = kvp.Value.StatMod;
+                if (!m.HasAnyValue) continue;
+                maxHp      += m.MaxHealth;
+                atkPower   += m.AttackPower;
+                physAbsorb += m.PhysicalAbsorbPercent;
+                physResist += m.PhysicalResistPercent;
+                magAbsorb  += m.MagicAbsorbPercent;
+                magResist  += m.MagicResistPercent;
+                crit       += m.CritChance;
+                lifeSteal  += m.MeleeLifeStealPercent;
+                projRange  += m.ProjectileRangeBonus;
+                projPierce += m.ProjectilePierceBonus;
+            }
+
+            // Layer 3: zone-wide stat modifier (zone aura, debuff field, environmental buff).
+            // Set by ArenaInstance when a player enters or exits a zone-effect area.
+            if (_zoneStatModifier.HasAnyValue)
+            {
+                maxHp      += _zoneStatModifier.MaxHealth;
+                atkPower   += _zoneStatModifier.AttackPower;
+                physAbsorb += _zoneStatModifier.PhysicalAbsorbPercent;
+                physResist += _zoneStatModifier.PhysicalResistPercent;
+                magAbsorb  += _zoneStatModifier.MagicAbsorbPercent;
+                magResist  += _zoneStatModifier.MagicResistPercent;
+                crit       += _zoneStatModifier.CritChance;
+                lifeSteal  += _zoneStatModifier.MeleeLifeStealPercent;
+                projRange  += _zoneStatModifier.ProjectileRangeBonus;
+                projPierce += _zoneStatModifier.ProjectilePierceBonus;
+            }
+
+            MaxHealth                 = maxHp;
+            AttackPower               = atkPower;
+            PhysicalAbsorbPercent     = physAbsorb;
+            PhysicalResistPercent     = physResist;
+            MagicAbsorbPercent        = magAbsorb;
+            MagicResistPercent        = magResist;
+            CritChance                = crit;
+            MeleeLifeStealPercent     = lifeSteal;
+            ProjectileRangeMultiplier = projRange;
+            ProjectilePierceBonus     = projPierce;
+
+            // Proportional HP scaling: if MaxHealth changed (e.g. equipped/unequipped an item
+            // with +HP), scale current Health by the same ratio so that equipping a +50 HP item
+            // adds 50 to both MaxHealth and current Health rather than just clamping down.
+            if (oldMaxHealth > 0f && MaxHealth != oldMaxHealth)
+                Health = MathF.Min(Health * (MaxHealth / oldMaxHealth), MaxHealth);
+            else
+                Health = MathF.Min(Health, MaxHealth);
+        }
+
+        /// <summary>
+        /// Builds the authoritative stats packet sent to a client after any stat change.
+        /// Public so <see cref="ArenaInstance"/> can send it after resolving a
+        /// stat-modifying status-effect tick.
+        /// </summary>
+        public PlayerStatsRefreshedPacket BuildStatsPacket() =>
+            new PlayerStatsRefreshedPacket
+            {
+                ActiveGearSetIndex    = (byte)ActiveGearSetIndex,
+                MaxHealth             = MaxHealth,
+                AttackPower           = AttackPower,
+                PhysicalAbsorbPercent = PhysicalAbsorbPercent,
+                PhysicalResistPercent = PhysicalResistPercent,
+                MagicAbsorbPercent    = MagicAbsorbPercent,
+                MagicResistPercent    = MagicResistPercent,
+                CritChance            = CritChance,
+                MeleeLifeStealPercent = MeleeLifeStealPercent,
+            };
+
+        private ItemInstance? FindInInventory(int instanceId)
+        {
+            for (int i = 0; i < _inventory.Count; i++)
+                if (_inventory[i].InstanceId == instanceId) return _inventory[i];
+            return null;
+        }
+
         public bool IsAlive => Health > 0f && !IsRespawning;
 
         // ── Respawn ───────────────────────────────────────────────────────────────────
@@ -124,6 +364,12 @@ namespace GameServer
         // spellId (0 = basic auto-attack) → last tick it was activated
         private readonly Dictionary<int, int> _cooldowns = new Dictionary<int, int>();
 
+        // ── Zone stat modifier ─────────────────────────────────────────────────────────────
+        // Applied by ArenaInstance when a player enters a zone-effect area (e.g. a buff field,
+        // a cursed zone, an environmental hazard).  Cleared when they leave.
+        // Included in every RecomputeStats() call as Layer 3 on top of base + equipment + buffs.
+        private StatModifier _zoneStatModifier;
+
         /// <summary>Returns true when the ability is not yet available this tick.</summary>
         public bool IsOnCooldown(int spellId, int currentTick, int cooldownTicks)
         {
@@ -135,6 +381,85 @@ namespace GameServer
         /// <summary>Records that the ability was just used on this tick.</summary>
         public void SetCooldown(int spellId, int currentTick)
             => _cooldowns[spellId] = currentTick;
+
+        // ── Zone stat modifier ─────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Replaces the active zone-wide stat modifier and immediately recomputes authoritative
+        /// stats.  Call with <see cref="StatModifier.Zero"/> to remove the zone effect.
+        ///
+        /// Typical use: player walks into a buff field → grant the modifier.
+        ///              Player leaves the field → clear it with Zero.
+        /// </summary>
+        public PlayerStatsRefreshedPacket SetZoneStatModifier(StatModifier modifier)
+        {
+            _zoneStatModifier = modifier;
+            RecomputeStats();
+            return BuildStatsPacket();
+        }
+
+        // ── Stat-buffing status effects ─────────────────────────────────────────────────────
+        // Standard TryApplyStatusEffect is for DoT/HoT effects (no stat change).
+        // TryApplyStatBuff is for temporary pure-stat modifiers: consumables, Battle Stance, etc.
+
+        /// <summary>
+        /// Applies a temporary stat-modifier effect (buff or debuff).  Unlike regular status
+        /// effects, this has no periodic damage component; it purely changes stats for the
+        /// duration.
+        ///
+        /// <paramref name="modifier"/> is summed in <see cref="RecomputeStats"/> while the
+        /// effect is active and removed when it expires via <see cref="TickStatusEffects"/>.
+        /// </summary>
+        public bool TryApplyStatBuff(
+            int effectId,
+            int sourceEntityId,
+            int durationTicks,
+            int stacks,
+            StatModifier modifier,
+            StatusEffectVisibility visibility,
+            out StatusEffectAppliedPacket packet,
+            out PlayerStatsRefreshedPacket? statsPacket)
+        {
+            statsPacket = null;
+
+            bool applied = TryApplyStatusEffect(
+                effectId, sourceEntityId, durationTicks, stacks,
+                tickDamage: 0, tickIntervalTicks: 0,
+                sourceHealPercentPerTick: 0f, visibility, out packet);
+
+            if (!applied) return false;
+
+            // Write the stat modifier into the newly stored effect.
+            if (modifier.HasAnyValue && _statusEffects.TryGetValue(effectId, out ActiveStatusEffect eff))
+            {
+                eff.StatMod = modifier;
+                _statusEffects[effectId] = eff;
+                RecomputeStats();
+                statsPacket = BuildStatsPacket();
+            }
+
+            return true;
+        }
+
+        // ── Inventory mutation ─────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Adds an item to the player's inventory.  Called when a ground item is picked up.
+        /// Does NOT auto-equip the item — equipping is a separate explicit player action
+        /// that routes through <see cref="TryEquipItem"/> and triggers a stat recompute.
+        ///
+        /// Returns <c>false</c> and discards the item when the inventory is full
+        /// (<paramref name="maxInventorySize"/> enforced server-side so clients cannot bloat
+        /// their inventory by racing pickups).
+        /// </summary>
+        public bool PickupItem(ItemInstance item, int maxInventorySize)
+        {
+            if (_inventory.Count >= maxInventorySize)
+                return false;
+
+            _inventory.Add(item);
+            return true;
+        }
 
         public void ApplyDamage(int damage, int killerEntityId = 0)
         {
@@ -173,6 +498,7 @@ namespace GameServer
                 existing.SourceHealPercentPerTick = sourceHealPercentPerTick;
                 existing.Stacks         = stacks;
                 existing.Visibility     = visibility;
+                // Preserve the existing StatMod on refresh — the stat buff is just being extended.
 
                 _statusEffects[effectId] = existing;
 
@@ -216,14 +542,23 @@ namespace GameServer
             return true;
         }
 
-        public void TickStatusEffects(
+        /// <summary>
+        /// Ticks all active status effects: decrements timers, fires periodic damage/heal,
+        /// and removes expired effects.
+        ///
+        /// Returns <c>true</c> when at least one stat-modifying effect expired this tick,
+        /// indicating that <see cref="ArenaInstance"/> must send a
+        /// <see cref="PlayerStatsRefreshedPacket"/> to this player's peer.
+        /// </summary>
+        public bool TickStatusEffects(
             IReadOnlyDictionary<int, PlayerSession> entityMap,
             List<CombatEventPacket> tickDamageEvents,
             List<StatusEffectRemovedPacket> expiredPackets)
         {
             if (_statusEffects.Count == 0)
-                return;
+                return false;
 
+            bool statsDirtied = false;
             _expiredStatusEffectIds.Clear();
             _statusEffectKeysBuffer.Clear();
 
@@ -276,6 +611,11 @@ namespace GameServer
                 ActiveStatusEffect effect = _statusEffects[effectId];
                 _statusEffects.Remove(effectId);
 
+                // If the expired effect carried a stat modifier, mark stats as dirty so
+                // ArenaInstance sends a PlayerStatsRefreshedPacket after this call returns.
+                if (effect.StatMod.HasAnyValue)
+                    statsDirtied = true;
+
                 expiredPackets.Add(new StatusEffectRemovedPacket
                 {
                     TargetEntityId = EntityId,
@@ -283,6 +623,13 @@ namespace GameServer
                     Visibility     = effect.Visibility,
                 });
             }
+
+            // Single RecomputeStats call after all expiries to avoid redundant recalculation
+            // when multiple stat-modifying effects expire on the same tick.
+            if (statsDirtied)
+                RecomputeStats();
+
+            return statsDirtied;
         }
 
         public void RestoreHealth(float amount)
@@ -337,6 +684,34 @@ namespace GameServer
 
             int safeTick = Math.Clamp(requestedTick, currentTick - maxRewindTicks, currentTick);
             return _positionHistory[safeTick % PositionHistorySize];
+        }
+
+        // ── State snapshot (heartbeat / zone handoff) ─────────────────────────────────────
+
+        /// <summary>
+        /// Produces a serialisable snapshot of the current authoritative session state for
+        /// Redis heartbeat saves or zone-transfer handoffs.
+        ///
+        /// <paramref name="includeInventory"/> should be <c>true</c> for open-world MMO zones
+        /// where items picked up mid-session must persist.  In Arena mode pass <c>false</c>
+        /// because in-session pickups are intentionally discarded at match end; only crafting
+        /// ingredient rewards (computed separately) are persisted.
+        /// </summary>
+        public DataLayer.LivePlayerState TakeSnapshot(bool includeInventory = true)
+        {
+            return new DataLayer.LivePlayerState
+            {
+                AccountId      = AccountId,
+                PlayerName     = PlayerName,
+                Position       = Position,
+                Health         = Health,
+                MaxHealth      = MaxHealth,
+                Inventory      = includeInventory ? _inventory.ToArray()
+                                                  : System.Array.Empty<DataLayer.ItemInstance>(),
+                GearSets       = GearSets,
+                ActiveGearSet  = ActiveGearSetIndex,
+                SnapshotTimeMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            };
         }
     }
 }

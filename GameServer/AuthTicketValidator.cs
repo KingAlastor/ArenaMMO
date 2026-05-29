@@ -49,69 +49,11 @@ namespace GameServer
             context = default;
             error = string.Empty;
 
-            if (packet.PlayerId <= 0)
-            {
-                error = "invalid-player-id";
+            // Run all common structural + cryptographic checks.
+            if (!TryValidateCommon(packet, out error))
                 return false;
-            }
-
-            if (string.IsNullOrWhiteSpace(packet.PlayerName) || packet.PlayerName.Length > MaxPlayerNameLength)
-            {
-                error = "invalid-player-name";
-                return false;
-            }
-
-            if (!Enum.IsDefined(typeof(FactionId), (FactionId)packet.Faction))
-            {
-                error = "invalid-faction";
-                return false;
-            }
-
-            if (string.IsNullOrWhiteSpace(packet.Nonce) || packet.Nonce.Length > MaxNonceLength)
-            {
-                error = "invalid-nonce";
-                return false;
-            }
-
-            if (string.IsNullOrWhiteSpace(packet.AllowedSpellIdsCsv) || packet.AllowedSpellIdsCsv.Length > MaxAllowedSpellIdsCsvLength)
-            {
-                error = "invalid-allowed-spells-shape";
-                return false;
-            }
-
-            if (!IsValidSignatureShape(packet.Signature))
-            {
-                error = "invalid-signature-shape";
-                return false;
-            }
 
             long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            if (packet.IssuedAtUnixMs > nowMs + AllowedClockSkewMs)
-            {
-                error = "ticket-issued-in-future";
-                return false;
-            }
-
-            if (packet.ExpiresAtUnixMs < nowMs - AllowedClockSkewMs)
-            {
-                error = "ticket-expired";
-                return false;
-            }
-
-            if (packet.ExpiresAtUnixMs <= packet.IssuedAtUnixMs)
-            {
-                error = "invalid-ticket-times";
-                return false;
-            }
-
-            // Canonical serialization must match the lobby signer exactly.
-            string canonical = BuildCanonicalString(packet);
-            string expectedSignature = ComputeSignature(canonical);
-            if (!FixedTimeEquals(packet.Signature, expectedSignature))
-            {
-                error = "invalid-signature";
-                return false;
-            }
 
             // Nonce cache prevents replaying a previously valid signed ticket.
             if (!_usedNonces.TryAdd(packet.Nonce, packet.ExpiresAtUnixMs))
@@ -130,6 +72,82 @@ namespace GameServer
                 packet.PlayerName,
                 (FactionId)packet.Faction,
                 allowedSpells);
+
+            return true;
+        }
+
+        /// <summary>
+        /// Performs all ticket validation steps EXCEPT nonce replay protection.
+        ///
+        /// WHY THIS METHOD EXISTS:
+        ///   When a player disconnects mid-match and reconnects during the grace period they
+        ///   present the same ticket they used on their first connection — the nonce was
+        ///   already consumed by <see cref="TryValidate"/>.  Rejecting it as a replay would
+        ///   prevent legitimate reconnects.
+        ///
+        ///   This variant is ONLY called by <see cref="ArenaInstance.TryAuthenticatePeer"/>
+        ///   after it has already confirmed that the AccountId is in the grace-period set
+        ///   (a server-side check, not derived from client input).  That confirmation means:
+        ///     • The player definitely connected before (so the nonce was legitimately used).
+        ///     • The ticket is still being verified for HMAC and expiry, preventing forgery.
+        ///   Skipping the nonce check is therefore safe here and is intentional.
+        ///
+        ///   IMPORTANT: Never call this without first confirming the grace-period membership
+        ///   server-side.  Calling it on arbitrary first connections defeats replay protection.
+        /// </summary>
+        public bool TryValidateForRejoin(AuthTicketPacket packet, out AuthenticatedPeerContext context, out string error)
+        {
+            context = default;
+            error = string.Empty;
+
+            // Run all common structural + cryptographic checks.
+            if (!TryValidateCommon(packet, out error))
+                return false;
+
+            // No nonce replay check — the nonce was consumed on first connect.
+            // HMAC and clock-window checks above are still enforced.
+
+            if (!TryParseAllowedSpells(packet.AllowedSpellIdsCsv, out HashSet<int> allowedSpells, out error))
+                return false;
+
+            context = new AuthenticatedPeerContext(
+                packet.PlayerId,
+                packet.PlayerName,
+                (FactionId)packet.Faction,
+                allowedSpells);
+
+            return true;
+        }
+
+        /// <summary>
+        /// Validates all fields that are identical for both first-connect and rejoin paths:
+        /// shape checks, clock window, and HMAC signature.
+        /// </summary>
+        private bool TryValidateCommon(AuthTicketPacket packet, out string error)
+        {
+            error = string.Empty;
+
+            if (packet.PlayerId <= 0)                { error = "invalid-player-id";           return false; }
+            if (string.IsNullOrWhiteSpace(packet.PlayerName) || packet.PlayerName.Length > MaxPlayerNameLength)
+                                                      { error = "invalid-player-name";          return false; }
+            if (!Enum.IsDefined(typeof(FactionId), (FactionId)packet.Faction))
+                                                      { error = "invalid-faction";              return false; }
+            if (string.IsNullOrWhiteSpace(packet.Nonce) || packet.Nonce.Length > MaxNonceLength)
+                                                      { error = "invalid-nonce";               return false; }
+            if (string.IsNullOrWhiteSpace(packet.AllowedSpellIdsCsv) || packet.AllowedSpellIdsCsv.Length > MaxAllowedSpellIdsCsvLength)
+                                                      { error = "invalid-allowed-spells-shape"; return false; }
+            if (!IsValidSignatureShape(packet.Signature))
+                                                      { error = "invalid-signature-shape";     return false; }
+
+            long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (packet.IssuedAtUnixMs > nowMs + AllowedClockSkewMs) { error = "ticket-issued-in-future"; return false; }
+            if (packet.ExpiresAtUnixMs < nowMs - AllowedClockSkewMs) { error = "ticket-expired";          return false; }
+            if (packet.ExpiresAtUnixMs <= packet.IssuedAtUnixMs)     { error = "invalid-ticket-times";    return false; }
+
+            string canonical         = BuildCanonicalString(packet);
+            string expectedSignature = ComputeSignature(canonical);
+            if (!FixedTimeEquals(packet.Signature, expectedSignature))
+                                                      { error = "invalid-signature"; return false; }
 
             return true;
         }

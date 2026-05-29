@@ -10,16 +10,21 @@ namespace SharedLibrary
     {
         public const float DefaultMoveSpeed = 5.0f;
         public const float MeleeRange       = 1.5f;
-        public const float ArenaBoundsHalf  = 50.0f;   // world extends ±50 units
 
         // ── Movement ──────────────────────────────────────────────────────────
 
         /// <summary>
         /// Returns the new authoritative position after applying a normalised input vector.
-        /// Arena bounds are enforced here on the server to prevent out-of-bounds exploits.
+        /// Boundary clamping is applied using the <paramref name="bounds"/> value supplied
+        /// by the caller, so this method works for any map size without compile-time constants.
+        ///
+        /// The bounds parameter replaces the old <c>ArenaBoundsHalf = 50f</c> constant that
+        /// was previously hardcoded here.  Each zone server passes its own
+        /// <see cref="WorldBounds"/> from <see cref="ZoneDescriptor"/>, enabling different
+        /// maps to reuse identical movement math with zone-specific extents.
         /// </summary>
         public static Vec2 Move(Vec2 current, float inputX, float inputY, float deltaTime,
-                                float speed = DefaultMoveSpeed)
+                                in WorldBounds bounds, float speed = DefaultMoveSpeed)
         {
             if (!float.IsFinite(current.X) || !float.IsFinite(current.Y))
                 current = Vec2.Zero;
@@ -33,8 +38,8 @@ namespace SharedLibrary
             if (!float.IsFinite(speed) || speed <= 0f)
                 speed = DefaultMoveSpeed;
 
-            float newX = Clamp(current.X + inputX * speed * deltaTime, -ArenaBoundsHalf, ArenaBoundsHalf);
-            float newY = Clamp(current.Y + inputY * speed * deltaTime, -ArenaBoundsHalf, ArenaBoundsHalf);
+            float newX = Clamp(current.X + inputX * speed * deltaTime, bounds.MinX, bounds.MaxX);
+            float newY = Clamp(current.Y + inputY * speed * deltaTime, bounds.MinY, bounds.MaxY);
             return new Vec2(newX, newY);
         }
 

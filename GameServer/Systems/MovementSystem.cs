@@ -12,8 +12,14 @@ namespace GameServer.Systems
         /// <summary>
         /// Validates the raw input vector, normalises it to prevent diagonal speed exploits,
         /// then writes the new authoritative position back to the player session.
+        ///
+        /// <paramref name="bounds"/> is passed from the zone descriptor so this method works
+        /// for any map size.  The old code called CombatMath.Move without bounds, relying on a
+        /// compile-time ArenaBoundsHalf constant — that would silently clamp players into a
+        /// 100×100 box on any map larger than the default arena.
         /// </summary>
-        public static void ProcessInput(PlayerSession player, PlayerInputPacket input, float deltaTime)
+        public static void ProcessInput(PlayerSession player, PlayerInputPacket input,
+                                        float deltaTime, in WorldBounds bounds)
         {
             if (!player.IsAlive)
                 return;
@@ -34,7 +40,7 @@ namespace GameServer.Systems
                 rawY *= inv;
             }
 
-            player.Position = CombatMath.Move(player.Position, rawX, rawY, deltaTime);
+            player.Position = CombatMath.Move(player.Position, rawX, rawY, deltaTime, bounds);
             player.LastProcessedClientTick = input.TickNumber;
         }
     }

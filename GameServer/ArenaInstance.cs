@@ -28,12 +28,13 @@ namespace GameServer
         private const float DeltaTime = 1f / TickRate;
         private const int   MsPerTick = 1000 / TickRate;
 
-        // Area-of-Interest replication radius. Entities beyond this distance from a viewer
-        // are not replicated, reducing O(N²) sends on large maps.
-        // 120f covers the full current arena (100×100 units, diagonal ≈ 141).
-        // Tune down for large escort/objective maps where distant players should not be visible.
-        private const float ViewRadius    = 120f;
-        private const float ViewRadiusSqr = ViewRadius * ViewRadius;
+        // ── Zone descriptor ───────────────────────────────────────────────────
+        // All zone topology and rules (bounds, view radius, spawn points, win condition, etc.)
+        // are injected via ZoneDescriptor so the same ArenaInstance code can host an Arena
+        // match or an open-world MMO zone without branching on a hard-coded mode flag.
+        private readonly ZoneDescriptor _zone;
+        // Pre-computed from _zone.ViewRadius to avoid the multiply on every BroadcastState tick.
+        private readonly float _viewRadiusSqr;
 
         // ── Player State ──────────────────────────────────────────────────────
 
@@ -51,9 +52,17 @@ namespace GameServer
         // Filled by network callbacks each tick; drained by ProcessTick().
 
         private readonly ConcurrentDictionary<NetPeer, PlayerInputPacket> _latestInputByPeer = new();
-        private readonly ConcurrentQueue<(NetPeer Peer, AttackRequestPacket    Packet)> _attackQueue = new();
-        private readonly ConcurrentQueue<(NetPeer Peer, SpellCastRequestPacket Packet)> _spellQueue  = new();
-        private readonly ConcurrentQueue<(NetPeer Peer, ShootRequestPacket     Packet)> _shootQueue  = new();
+        private readonly ConcurrentQueue<(NetPeer Peer, AttackRequestPacket    Packet)> _attackQueue    = new();
+        private readonly ConcurrentQueue<(NetPeer Peer, SpellCastRequestPacket Packet)> _spellQueue     = new();
+        private readonly ConcurrentQueue<(NetPeer Peer, ShootRequestPacket     Packet)> _shootQueue     = new();
+        // Latest-wins: only the most recent swap request per peer is processed each tick,
+        // matching the movement input model to avoid per-peer allocation churn.
+        private readonly ConcurrentDictionary<NetPeer, GearSetSwapRequestPacket> _latestGearSwapByPeer = new();
+        // Individual item equip/unequip requests — queued so multiple fast requests in one
+        // tick are not silently dropped (player may swap several slots quickly).
+        private readonly ConcurrentQueue<(NetPeer Peer, EquipItemRequestPacket Packet)> _equipItemQueue = new();
+        // Ground item pickup requests — queued for phase-ordered resolution after movement.
+        private readonly ConcurrentQueue<(NetPeer Peer, GroundItemPickupRequestPacket Packet)> _pickupQueue = new();
         // IntentGuard enforces anti-spam, tick skew, and replay rules before intents enter simulation.
         private readonly IntentGuard _intentGuard = new();
         // Ticket validator is the trust boundary between lobby-issued identity and live arena authority.
@@ -74,26 +83,43 @@ namespace GameServer
         private bool _isRunning = false;
         private bool _matchEnded = false;
 
-        // Faction-based default spawn points.
-        // TODO: Replace with per-map configurable spawn data when the map system is implemented.
-        private static readonly Vec2 SpawnAlpha = new Vec2(-30f, 0f);
-        private static readonly Vec2 SpawnBeta  = new Vec2( 30f, 0f);
+        // ── Grace-period reconnect (Dota2-style rejoin) ───────────────────────
+        // When a player drops, their session is kept alive as a stationary ghost for
+        // RejoinGraceTicks ticks (default 5 min at 30 Hz = 9000 ticks). If they reconnect
+        // within the window their peer is reattached and they resume normally.
+        // If the window expires their entity is fully despawned.
+        private readonly Dictionary<int, (PlayerSession Session, int ExpiryTick)> _gracePeriodSessions = new();
+        private readonly List<int> _expiredGraceAccountIds = new();
 
-        private static Vec2 GetSpawnPoint(FactionId faction)
-            => faction == FactionId.Alpha ? SpawnAlpha : SpawnBeta;
+        // ── Ground items ──────────────────────────────────────────────────────
+        private readonly Dictionary<int, GroundItem> _groundItems = new();
+        private int _nextGroundItemId = 1;
 
         private readonly MatchDataService? _dataService;
+
+        // Max individual equip requests drained per tick — prevents a burst of requests from
+        // hogging tick time; each request is O(inventory size) which is bounded but non-zero.
+        private const int MaxEquipDrainPerTick = 7;
 
         // ── Entry Point ───────────────────────────────────────────────────────
 
         /// <summary>
         /// Creates one arena runtime with a ticket validator bound to the configured signing secret.
         /// The secret is never rotated in-process; restart the server after secret changes.
+        /// <paramref name="restrictEquipToRespawnWindow"/> restricts all gear changes to the
+        /// respawn window when true (default/arena). Pass false for MMO instances.
         /// </summary>
-        public ArenaInstance(string ticketSecret, MatchDataService? dataService = null)
+        /// <summary>
+        /// Creates one arena/zone runtime bound to the provided zone descriptor.
+        /// The zone descriptor is the single source of truth for map topology, rules, and
+        /// routing policy — pass a default <see cref="ZoneDescriptor"/> for Arena mode.
+        /// </summary>
+        public ArenaInstance(string ticketSecret, ZoneDescriptor zone, MatchDataService? dataService = null)
         {
-            _ticketValidator = new AuthTicketValidator(ticketSecret);
-            _dataService     = dataService;
+            _zone             = zone;
+            _viewRadiusSqr    = zone.ViewRadius * zone.ViewRadius;
+            _ticketValidator  = new AuthTicketValidator(ticketSecret);
+            _dataService      = dataService;
         }
 
         /// <summary>Starts the network listener and blocks on the game loop until shutdown.</summary>
@@ -113,6 +139,24 @@ namespace GameServer
         /// </summary>
         public bool TryAuthenticatePeer(NetPeer peer, AuthTicketPacket ticket, IPAddress? ip)
         {
+            // ── Rejoin path (grace-period reconnect) ───────────────────────────────
+            // If the AccountId is already in the grace-period set, skip nonce replay
+            // (the nonce was consumed on first connect) but still verify the HMAC and
+            // clock window to prevent ticket forgery.  The grace-period membership check
+            // is the server-side proof that the nonce was legitimately used before.
+            if (_gracePeriodSessions.TryGetValue(ticket.PlayerId, out var grace) &&
+                grace.ExpiryTick > _tick)
+            {
+                if (_ticketValidator.TryValidateForRejoin(ticket, out AuthenticatedPeerContext ctx, out string rejoinError))
+                {
+                    OnPlayerRejoined(peer, grace.Session, ctx);
+                    return true;
+                }
+                SecurityTelemetry.RecordInvalidTicket(rejoinError, ip);
+                return false;
+            }
+
+            // ── Normal first-time connect path ─────────────────────────────────────
             if (!_ticketValidator.TryValidate(ticket, out AuthenticatedPeerContext context, out string error))
             {
                 SecurityTelemetry.RecordInvalidTicket(error, ip);
@@ -136,35 +180,21 @@ namespace GameServer
                 PlayerName = context.PlayerName,
                 Peer       = peer,
                 Faction    = context.Faction,
-                Position   = GetSpawnPoint(context.Faction),
-                Health     = 100f,
-                MaxHealth  = 100f,
+                Position   = _zone.GetSpawnPoint(context.Faction),
             };
             session.ReplaceAllowedSpells(context.AllowedSpellIds);
 
-            // Hydrate authoritative stats from the lobby-cached Redis profile when available.
-            // Falls back to session defaults above when no profile is found.
             PlayerProfile? profile = _dataService?.LoadPlayerProfile(context.PlayerId);
             if (profile != null)
-            {
-                session.MaxHealth             = profile.MaxHealth;
-                session.Health                = profile.MaxHealth;
-                session.AttackPower           = profile.AttackPower;
-                session.PhysicalAbsorbPercent = profile.PhysicalAbsorbPercent;
-                session.PhysicalResistPercent = profile.PhysicalResistPercent;
-                session.MagicAbsorbPercent    = profile.MagicAbsorbPercent;
-                session.MagicResistPercent    = profile.MagicResistPercent;
-                session.CritChance            = profile.CritChance;
-                session.MeleeLifeStealPercent = profile.MeleeLifeStealPercent;
-            }
+                session.HydrateFromProfile(profile);
+            else
+                session.Health = session.MaxHealth;
 
             _players.Add(session);
             _peerMap[peer]               = session;
             _entityMap[session.EntityId] = session;
             _intentGuard.OnPeerConnected(peer);
 
-            // Announce the new player to all currently connected peers (including the new player's
-            // own client so it can confirm its EntityId).
             _network?.SendToAll(new EntitySpawnPacket
             {
                 EntityId   = session.EntityId,
@@ -174,8 +204,6 @@ namespace GameServer
                 Y          = session.Position.Y,
             }, DeliveryMethod.ReliableOrdered);
 
-            // Send every already-existing entity to the new player so their client can hydrate state.
-            // The new player is the last element; exclude it from the back-fill loop.
             for (int i = 0; i < _players.Count - 1; i++)
             {
                 PlayerSession existing = _players[i];
@@ -192,24 +220,64 @@ namespace GameServer
             Console.WriteLine($"[Arena] Authenticated {session.PlayerName} (account={session.AccountId}, entity={session.EntityId})");
         }
 
+        /// <summary>
+        /// Reattaches a reconnecting peer to their existing session that was preserved in the
+        /// grace-period set.  The session was kept alive as a stationary ghost; this call
+        /// restores their live peer reference and resumes normal simulation.
+        /// </summary>
+        private void OnPlayerRejoined(NetPeer peer, PlayerSession session, AuthenticatedPeerContext context)
+        {
+            session.Peer = peer;
+            _peerMap[peer] = session;
+            _gracePeriodSessions.Remove(session.AccountId);
+            _intentGuard.OnPeerConnected(peer);
+
+            // Send the rejoining player a full state-sync so their client can restore all
+            // existing entities, ground items, and their own current health/stats.
+            for (int i = 0; i < _players.Count; i++)
+            {
+                PlayerSession existing = _players[i];
+                _network?.SendTo(peer, new EntitySpawnPacket
+                {
+                    EntityId   = existing.EntityId,
+                    PlayerName = existing.PlayerName,
+                    Faction    = (byte)existing.Faction,
+                    X          = existing.Position.X,
+                    Y          = existing.Position.Y,
+                }, DeliveryMethod.ReliableOrdered);
+            }
+
+            // Notify all other players that this entity has reconnected.
+            _network?.SendToAll(new PlayerReconnectedPacket
+            {
+                EntityId = session.EntityId,
+            }, DeliveryMethod.ReliableOrdered);
+
+            Console.WriteLine($"[Arena] {session.PlayerName} rejoined (account={session.AccountId}, entity={session.EntityId})");
+        }
+
         public void OnPlayerDisconnected(NetPeer peer)
         {
-            if (_peerMap.TryGetValue(peer, out PlayerSession? session))
+            if (!_peerMap.TryGetValue(peer, out PlayerSession? session))
+                return;
+
+            _peerMap.Remove(peer);
+            _latestInputByPeer.TryRemove(peer, out _);
+            _intentGuard.OnPeerDisconnected(peer);
+
+            // Keep the session alive as a stationary ghost for RejoinGraceTicks ticks.
+            // The peer reference is cleared so BroadcastState and SendToInterested skip
+            // this ghost without crashing.  The session remains in _players and _entityMap
+            // so it still participates in combat (other players can attack it).
+            session.Peer = null;
+            _gracePeriodSessions[session.AccountId] = (session, _tick + _zone.RejoinGraceTicks);
+
+            _network?.SendToAll(new PlayerGraceDisconnectPacket
             {
-                _peerMap.Remove(peer);
-                _entityMap.Remove(session.EntityId);
-                RemovePlayerFromList(session);
-                _latestInputByPeer.TryRemove(peer, out _);
-                _intentGuard.OnPeerDisconnected(peer);
+                EntityId = session.EntityId,
+            }, DeliveryMethod.ReliableOrdered);
 
-                // Notify remaining clients so they can despawn the disconnected entity.
-                _network?.SendToAll(new EntityDespawnPacket
-                {
-                    EntityId = session.EntityId,
-                }, DeliveryMethod.ReliableOrdered);
-
-                Console.WriteLine($"[Arena] Removed {session.PlayerName} (id={session.EntityId})");
-            }
+            Console.WriteLine($"[Arena] {session.PlayerName} disconnected — grace period active ({_zone.RejoinGraceTicks} ticks)");
         }
 
         /// <summary>
@@ -298,6 +366,36 @@ namespace GameServer
             _spellQueue.Enqueue((peer, packet));
         }
 
+        public void EnqueueGearSetSwap(NetPeer peer, GearSetSwapRequestPacket packet)
+        {
+            if (!InputSanitizer.IsValid(packet))
+            {
+                SecurityTelemetry.RecordInvalidPacket("invalid-gearswap-packet", peer);
+                return;
+            }
+
+            // Latest-wins: overwrite any earlier pending request for this peer.
+            // A player can only have 2 gear sets so the valid state space is bounded.
+            _latestGearSwapByPeer[peer] = packet;
+        }
+
+        public void EnqueueItemPickup(NetPeer peer, GroundItemPickupRequestPacket packet)
+        {
+            if (packet.GroundItemId <= 0) return;
+            _pickupQueue.Enqueue((peer, packet));
+        }
+
+        public void EnqueueEquipItem(NetPeer peer, EquipItemRequestPacket packet)
+        {
+            if (!InputSanitizer.IsValid(packet))
+            {
+                SecurityTelemetry.RecordInvalidPacket("invalid-equipitem-packet", peer);
+                return;
+            }
+
+            _equipItemQueue.Enqueue((peer, packet));
+        }
+
         public void EnqueueShoot(NetPeer peer, ShootRequestPacket packet)
         {
             if (!InputSanitizer.IsValid(packet))
@@ -338,11 +436,20 @@ namespace GameServer
             {
                 sw.Restart();
 
-                _network!.PollEvents();   // fires queued callbacks → fills the input queues
-                ProcessTick();             // drain queues & run authoritative simulation
-                BroadcastState();          // push authoritative positions + health to all peers
+                _network!.PollEvents();
+                ProcessTick();
+                BroadcastState();
 
-                // Emit periodic security counters to provide low-cost operational observability.
+                // Heartbeat: flush all player states to Redis every 60 s for crash recovery
+                // and zone-handoff readiness.  Fire-and-forget — does not block the tick loop.
+                if ((_tick % (TickRate * 60)) == 0 && _tick > 0)
+                    FlushAllPlayerStates();
+
+                // Grace-period eviction: remove sessions whose reconnect window has expired
+                // (checked every second to avoid O(N) iteration every tick at high CCU).
+                if ((_tick % TickRate) == 0)
+                    EvictExpiredGracePeriods();
+
                 if ((_tick % (TickRate * 10)) == 0)
                     SecurityTelemetry.PrintSnapshot();
 
@@ -365,7 +472,7 @@ namespace GameServer
                     continue;
 
                 if (_peerMap.TryGetValue(entry.Key, out PlayerSession? player))
-                    MovementSystem.ProcessInput(player, latestInput, DeltaTime);
+                    MovementSystem.ProcessInput(player, latestInput, DeltaTime, _zone.Bounds);
             }
             // Snapshot authoritative positions after movement for lag-compensation rewind.
             for (int i = 0; i < _players.Count; i++)
@@ -427,7 +534,7 @@ namespace GameServer
                 _projectiles.Add(proj);
                 shooter.SetCooldown(spell.SpellId, _tick);
 
-                _network?.SendToAll(new ProjectileSpawnPacket
+                _network?.SendToInterested(new ProjectileSpawnPacket
                 {
                     ProjectileId = proj.ProjectileId,
                     OwnerId      = proj.OwnerId,
@@ -438,7 +545,7 @@ namespace GameServer
                     DirectionY   = proj.DirectionY,
                     Speed        = proj.Speed,
                     MaxRange     = proj.MaxRange,
-                }, DeliveryMethod.ReliableOrdered);
+                }, DeliveryMethod.ReliableOrdered, proj.Position, _zone.EventFilter, _players);
             }
 
             // ── 5. Tick active projectiles (move + collision) ─────────────────────
@@ -470,11 +577,12 @@ namespace GameServer
                     foreach (var (projId, ev) in result.Hits)
                     {
                         BroadcastCombatEvent(ev);
-                        _network?.SendToAll(new ProjectileDestroyPacket
+                        Vec2 hitOrigin = FindById(ev.TargetId)?.Position ?? Vec2.Zero;
+                        _network?.SendToInterested(new ProjectileDestroyPacket
                         {
                             ProjectileId = projId,
                             HitSomething = true,
-                        }, DeliveryMethod.ReliableOrdered);
+                        }, DeliveryMethod.ReliableOrdered, hitOrigin, _zone.EventFilter, _players);
                     }
                 }
 
@@ -494,7 +602,12 @@ namespace GameServer
             _statusTickEvents.Clear();
             _expiredStatusEffects.Clear();
             for (int i = 0; i < _players.Count; i++)
-                _players[i].TickStatusEffects(_entityMap, _statusTickEvents, _expiredStatusEffects);
+            {
+                bool statsDirty = _players[i].TickStatusEffects(_entityMap, _statusTickEvents, _expiredStatusEffects);
+                // If a stat-modifying effect expired, send the updated stats to the player's peer.
+                if (statsDirty && _players[i].Peer != null)
+                    _network?.SendTo(_players[i].Peer!, _players[i].BuildStatsPacket(), DeliveryMethod.ReliableOrdered);
+            }
 
             if (_statusTickEvents.Count > 0)
             {
@@ -521,18 +634,18 @@ namespace GameServer
                     p.DeathCount++;
                     p.StartRespawn();
 
-                    // Credit the kill to the attacker if identifiable.
                     if (p.LastKillerEntityId != 0 &&
                         _entityMap.TryGetValue(p.LastKillerEntityId, out PlayerSession? killer))
                     {
                         killer.KillCount++;
                     }
 
-                    _network?.SendToAll(new PlayerDeathPacket
+                    Vec2 deathPos = p.Position;
+                    _network?.SendToInterested(new PlayerDeathPacket
                     {
                         KilledEntityId = p.EntityId,
                         KillerEntityId = p.LastKillerEntityId,
-                    }, DeliveryMethod.ReliableOrdered);
+                    }, DeliveryMethod.ReliableOrdered, deathPos, _zone.EventFilter, _players);
                 }
             }
 
@@ -540,16 +653,84 @@ namespace GameServer
             for (int i = 0; i < _players.Count; i++)
             {
                 PlayerSession p = _players[i];
-                if (p.TickRespawn(GetSpawnPoint(p.Faction)))
+                Vec2 spawnPoint = _zone.GetSpawnPoint(p.Faction);
+                if (p.TickRespawn(spawnPoint))
                 {
-                    _network?.SendToAll(new PlayerRespawnPacket
+                    _network?.SendToInterested(new PlayerRespawnPacket
                     {
                         EntityId = p.EntityId,
                         X        = p.Position.X,
                         Y        = p.Position.Y,
                         Health   = p.Health,
-                    }, DeliveryMethod.ReliableOrdered);
+                    }, DeliveryMethod.ReliableOrdered, spawnPoint, _zone.EventFilter, _players);
                 }
+            }
+
+            // ── Phase 9b: Equip / gear-set swap ──────────────────────────────────
+            // Gear changes are always permitted — the old respawn-window gate has been removed.
+            // isPermitted was replaced by ownership-only validation inside TryEquipItem/
+            // TryUnequipSlot/TryApplyGearSet, which check that the item is actually in the
+            // player's inventory before accepting the request.
+
+            // --- Part A: individual item equips/unequips ---
+            int equipDrained = 0;
+            while (equipDrained < MaxEquipDrainPerTick && _equipItemQueue.TryDequeue(out (NetPeer Peer, EquipItemRequestPacket Packet) eq))
+            {
+                equipDrained++;
+                if (!_peerMap.TryGetValue(eq.Peer, out PlayerSession? eqSession)) continue;
+
+                bool success = eq.Packet.ItemInstanceId == 0
+                    ? eqSession.TryUnequipSlot(eq.Packet.Slot, out PlayerStatsRefreshedPacket eqPkt)
+                    : eqSession.TryEquipItem(eq.Packet.ItemInstanceId, out eqPkt);
+
+                if (success && eqSession.Peer != null)
+                    _network?.SendTo(eqSession.Peer, eqPkt, DeliveryMethod.ReliableOrdered);
+            }
+
+            // --- Part B: preset gear-set quickswaps (latest-wins) ---
+            foreach (KeyValuePair<NetPeer, GearSetSwapRequestPacket> entry in _latestGearSwapByPeer)
+            {
+                if (!_latestGearSwapByPeer.TryRemove(entry.Key, out GearSetSwapRequestPacket? swapReq))
+                    continue;
+
+                if (!_peerMap.TryGetValue(entry.Key, out PlayerSession? swapSession))
+                    continue;
+
+                if (swapSession.TryApplyGearSet(swapReq.SetIndex, out PlayerStatsRefreshedPacket refreshPkt))
+                {
+                    if (swapSession.Peer != null)
+                        _network?.SendTo(swapSession.Peer, refreshPkt, DeliveryMethod.ReliableOrdered);
+                    Console.WriteLine($"[Arena] {swapSession.PlayerName} swapped to gear set {swapReq.SetIndex}");
+                }
+            }
+
+            // ── Phase 9c: Ground item pickups ─────────────────────────────────────
+            while (_pickupQueue.TryDequeue(out (NetPeer Peer, GroundItemPickupRequestPacket Packet) pickup))
+            {
+                if (!_peerMap.TryGetValue(pickup.Peer, out PlayerSession? picker)) continue;
+                if (!_groundItems.TryGetValue(pickup.Packet.GroundItemId, out GroundItem? groundItem)) continue;
+
+                // Server-side distance check: player must be within 2 units of the ground item.
+                if (CombatMath.DistanceSqr(picker.Position, groundItem.Position) > 4f) continue;
+
+                // Ownership enforcement: inventory size is capped server-side, not client-side.
+                if (!picker.PickupItem(groundItem.Item, _zone.MaxInventorySize)) continue;
+
+                _groundItems.Remove(pickup.Packet.GroundItemId);
+
+                // Tell everyone nearby the item is gone.
+                _network?.SendToInterested(new GroundItemRemovedPacket
+                {
+                    GroundItemId = groundItem.GroundItemId,
+                }, DeliveryMethod.ReliableOrdered, groundItem.Position, _zone.EventFilter, _players);
+
+                // Confirm to the picking player that the item was added to their inventory.
+                if (picker.Peer != null)
+                    _network?.SendTo(picker.Peer, new ItemAddedToInventoryPacket
+                    {
+                        DefinitionId = groundItem.Item.DefinitionId,
+                        InstanceId   = groundItem.Item.InstanceId,
+                    }, DeliveryMethod.ReliableOrdered);
             }
 
             // ── Phase 10: Win-condition check ─────────────────────────────────────
@@ -563,23 +744,22 @@ namespace GameServer
         {
             if (_network == null) return;
 
-            // Positions are public. Health is sent separately only to allied recipients.
-            // Entities outside ViewRadiusSqr are skipped per viewer; own entity is always sent
-            // so client-side reconciliation (AcknowledgedTick) is never starved.
             for (int viewerIndex = 0; viewerIndex < _players.Count; viewerIndex++)
             {
                 PlayerSession viewer = _players[viewerIndex];
+                // Skip ghost sessions whose peer was cleared on disconnect.
+                // They have no live socket to receive state updates.
+                if (viewer.Peer == null) continue;
 
                 for (int entityIndex = 0; entityIndex < _players.Count; entityIndex++)
                 {
                     PlayerSession entity = _players[entityIndex];
 
-                    // Always replicate the viewer's own state; skip entities outside view radius.
                     if (entity.EntityId != viewer.EntityId &&
-                        CombatMath.DistanceSqr(viewer.Position, entity.Position) > ViewRadiusSqr)
+                        CombatMath.DistanceSqr(viewer.Position, entity.Position) > _viewRadiusSqr)
                         continue;
 
-                    _network.SendTo(viewer.Peer!, new EntityPositionPacket
+                    _network.SendTo(viewer.Peer, new EntityPositionPacket
                     {
                         EntityId         = entity.EntityId,
                         X                = entity.Position.X,
@@ -590,7 +770,7 @@ namespace GameServer
 
                     if (entity.Faction == viewer.Faction)
                     {
-                        _network.SendTo(viewer.Peer!, new EntityHealthPacket
+                        _network.SendTo(viewer.Peer, new EntityHealthPacket
                         {
                             EntityId = entity.EntityId,
                             Health   = entity.Health,
@@ -601,10 +781,19 @@ namespace GameServer
         }
 
         private void BroadcastCombatEvent(CombatEventPacket ev)
-            => _network?.SendToAll(ev, DeliveryMethod.ReliableOrdered);
+        {
+            // Route through interest filter so only nearby players receive this event.
+            // In Arena mode EventFilter is BroadcastFilter (all players); in open-world zones
+            // it is a RadiusFilter so distant players are not spammed with irrelevant events.
+            Vec2 origin = FindById(ev.TargetId)?.Position ?? Vec2.Zero;
+            _network?.SendToInterested(ev, DeliveryMethod.ReliableOrdered, origin, _zone.EventFilter, _players);
+        }
 
         private void BroadcastAoEHitEvent(AoEHitEventPacket ev)
-            => _network?.SendToAll(ev, DeliveryMethod.ReliableOrdered);
+        {
+            Vec2 origin = FindById(ev.HitEntityId)?.Position ?? Vec2.Zero;
+            _network?.SendToInterested(ev, DeliveryMethod.ReliableOrdered, origin, _zone.EventFilter, _players);
+        }
 
         // ── Win Condition ─────────────────────────────────────────────────────
 
@@ -678,17 +867,19 @@ namespace GameServer
 
             if (packet.Visibility == StatusEffectVisibility.Everyone)
             {
-                _network.SendToAll(packet, DeliveryMethod.ReliableOrdered);
+                _network.SendToInterested(packet, DeliveryMethod.ReliableOrdered,
+                    target.Position, _zone.EventFilter, _players);
                 return;
             }
 
             for (int i = 0; i < _players.Count; i++)
             {
                 PlayerSession viewer = _players[i];
-                if (viewer.Faction != target.Faction)
-                    continue;
-
-                _network.SendTo(viewer.Peer!, packet, DeliveryMethod.ReliableOrdered);
+                // Skip ghost sessions and enemy players.
+                if (viewer.Peer == null) continue;
+                if (viewer.Faction != target.Faction) continue;
+                if (!_zone.EventFilter.ShouldReceive(viewer, target.Position)) continue;
+                _network.SendTo(viewer.Peer, packet, DeliveryMethod.ReliableOrdered);
             }
         }
 
@@ -700,17 +891,18 @@ namespace GameServer
 
             if (packet.Visibility == StatusEffectVisibility.Everyone)
             {
-                _network.SendToAll(packet, DeliveryMethod.ReliableOrdered);
+                _network.SendToInterested(packet, DeliveryMethod.ReliableOrdered,
+                    target.Position, _zone.EventFilter, _players);
                 return;
             }
 
             for (int i = 0; i < _players.Count; i++)
             {
                 PlayerSession viewer = _players[i];
-                if (viewer.Faction != target.Faction)
-                    continue;
-
-                _network.SendTo(viewer.Peer!, packet, DeliveryMethod.ReliableOrdered);
+                if (viewer.Peer == null) continue;
+                if (viewer.Faction != target.Faction) continue;
+                if (!_zone.EventFilter.ShouldReceive(viewer, target.Position)) continue;
+                _network.SendTo(viewer.Peer, packet, DeliveryMethod.ReliableOrdered);
             }
         }
 
@@ -718,5 +910,98 @@ namespace GameServer
 
         private PlayerSession? FindById(int entityId)
             => _entityMap.TryGetValue(entityId, out PlayerSession? s) ? s : null;
+
+        // ── Heartbeat / grace-period maintenance ──────────────────────────────
+
+        /// <summary>
+        /// Fire-and-forget: writes every active player's state to Redis so a crash loses at
+        /// most 60 s of progress.  Does not block the game loop; awaited on a thread-pool thread.
+        /// In Arena mode inventories are NOT included (pickups are match-scoped).
+        /// In open-world zones inventories ARE included (items picked up must persist).
+        /// </summary>
+        private void FlushAllPlayerStates()
+        {
+            if (_dataService?.Sink == null) return;
+
+            bool includeInventory = !_zone.IsArenaMode;
+            for (int i = 0; i < _players.Count; i++)
+                _ = _dataService.Sink.FlushAsync(_players[i].TakeSnapshot(includeInventory));
+        }
+
+        /// <summary>
+        /// Removes players whose reconnect grace period has expired from the simulation.
+        /// Called once per second (every TickRate ticks) to avoid O(N) work every tick.
+        /// </summary>
+        private void EvictExpiredGracePeriods()
+        {
+            if (_gracePeriodSessions.Count == 0) return;
+
+            _expiredGraceAccountIds.Clear();
+            foreach (KeyValuePair<int, (PlayerSession Session, int ExpiryTick)> kvp in _gracePeriodSessions)
+            {
+                if (kvp.Value.ExpiryTick <= _tick)
+                    _expiredGraceAccountIds.Add(kvp.Key);
+            }
+
+            for (int i = 0; i < _expiredGraceAccountIds.Count; i++)
+            {
+                int accountId = _expiredGraceAccountIds[i];
+                if (!_gracePeriodSessions.TryGetValue(accountId, out var grace)) continue;
+
+                _gracePeriodSessions.Remove(accountId);
+                _entityMap.Remove(grace.Session.EntityId);
+                RemovePlayerFromList(grace.Session);
+
+                // Notify clients that this entity is permanently gone.
+                _network?.SendToAll(new EntityDespawnPacket
+                {
+                    EntityId = grace.Session.EntityId,
+                }, DeliveryMethod.ReliableOrdered);
+
+                Console.WriteLine($"[Arena] Grace period expired for {grace.Session.PlayerName} — entity despawned.");
+            }
+        }
+
+        /// <summary>
+        /// Computes crafting ingredient rewards earned by <paramref name="player"/> in this match.
+        /// Rewards are the only durable progression output from an Arena match (in-session pickups
+        /// are discarded by design so Arena balance is not affected by loot variance).
+        /// </summary>
+        private CraftingIngredientReward[] ComputeCraftingRewards(PlayerSession player, FactionId winner)
+        {
+            // Base participation reward: ingredient 1 (generic "arena shard"), quantity = 1.
+            // Kill bonus: +1 per kill.  Win bonus: +2 extra shards.
+            // TODO: Replace with a configurable reward table once designer tooling is available.
+            int total = 1 + player.KillCount + (player.Faction == winner ? 2 : 0);
+            if (total <= 0) return System.Array.Empty<CraftingIngredientReward>();
+            return new[] { new CraftingIngredientReward { IngredientId = 1, Quantity = total } };
+        }
+
+        // ── Ground item helpers ───────────────────────────────────────────────
+
+        /// <summary>
+        /// Spawns a lootable item on the ground and notifies all interested players.
+        /// Called by CombatSystem or future drop-table logic when an entity is slain.
+        /// </summary>
+        public void SpawnGroundItem(Vec2 position, ItemInstance item)
+        {
+            int id = _nextGroundItemId++;
+            _groundItems[id] = new GroundItem { GroundItemId = id, Position = position, Item = item };
+            _network?.SendToInterested(new GroundItemSpawnedPacket
+            {
+                GroundItemId = id,
+                DefinitionId = item.DefinitionId,
+                X            = position.X,
+                Y            = position.Y,
+            }, DeliveryMethod.ReliableOrdered, position, _zone.EventFilter, _players);
+        }
+
+        /// <summary>Lightweight container for a lootable item that has landed on the ground.</summary>
+        private sealed class GroundItem
+        {
+            public int          GroundItemId;
+            public Vec2         Position;
+            public ItemInstance Item = null!;
+        }
     }
 }

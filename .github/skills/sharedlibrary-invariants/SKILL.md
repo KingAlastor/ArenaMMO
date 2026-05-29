@@ -58,6 +58,7 @@ Packets are grouped by direction and purpose.
 - `AttackRequestPacket` — melee attack intent + `ActionSequenceId`.
 - `SpellCastRequestPacket` — spell cast intent + AoE center + tick number + `ActionSequenceId`.
 - `ShootRequestPacket` — shoot intent + direction + `ActionSequenceId`.
+- `GroundItemPickupRequestPacket` — client requests pickup of a specific ground item. Fields: `int GroundItemId`. Server validates ownership, distance, and inventory space.
 
 ### Server → Client (authoritative state)
 - `EntityPositionPacket` — authoritative position + `ServerTick` + `AcknowledgedTick` for reconciliation.
@@ -65,7 +66,7 @@ Packets are grouped by direction and purpose.
 - `EntitySpawnPacket` — broadcast when a player successfully authenticates and enters the arena. Fields: `EntityId`, `PlayerName`, `Faction`, `X`, `Y`.
 - `EntityDespawnPacket` — broadcast when a player disconnects. Fields: `EntityId`.
 - `CombatEventPacket` — single-target hit event (melee or single-target spell). Fields: `AttackerId`, `TargetId`, `Damage`, `IsCritical`.
-- `AoEHitEventPacket` — one packet per entity hit by an AoE or MeleeSplash spell. Fields: `CasterId`, `SpellId`, `HitEntityId`, `Damage`, `IsCritical`. Broadcast to all peers.
+- `AoEHitEventPacket` — one packet per entity hit by an AoE or MeleeSplash spell. Fields: `CasterId`, `SpellId`, `HitEntityId`, `Damage`, `IsCritical`. **Note:** the hit-target field is `HitEntityId` — there is no `TargetId` field on this packet. Do not reference `TargetId` here; that causes compile errors.
 - `ProjectileSpawnPacket` — authoritative projectile creation event.
 - `ProjectileDestroyPacket` — projectile removal event (hit or expiry).
 - `StatusEffectAppliedPacket` — visibility-filtered status effect application.
@@ -73,13 +74,21 @@ Packets are grouped by direction and purpose.
 - `PlayerDeathPacket` — broadcast on kill. Fields: `KilledEntityId`, `KillerEntityId`.
 - `PlayerRespawnPacket` — broadcast when a player re-enters play after respawn timer. Fields: `EntityId`, `X`, `Y`, `Health`.
 - `MatchEndPacket` — broadcast once when win condition is met. Fields: `WinnerFaction` (byte).
+- `GroundItemSpawnedPacket` — sent to interested viewers when a ground item appears. Fields: `int GroundItemId, int DefinitionId, float X, float Y`.
+- `GroundItemRemovedPacket` — sent to interested viewers when a ground item is picked up or despawned. Fields: `int GroundItemId`.
+- `ItemAddedToInventoryPacket` — sent only to the owning client when an item enters their inventory. Fields: `int InstanceId, int DefinitionId`.
+- `PlayerGraceDisconnectPacket` — sent to all peers when a player loses connection but enters the grace-period. Fields: `int EntityId`. Clients show a disconnected indicator; the ghost entity remains in world.
+- `PlayerReconnectedPacket` — sent to all peers when a grace-period player successfully rejoins. Fields: `int EntityId`.
+- `CraftingRewardPacket` — sent to the owning client at Arena match end to notify earned crafting ingredients. Fields: `string RewardsCsv` (format `"id:qty,id:qty,..."`). Parsing and crediting happen in ProfileServer via the Redis `crafting-reward:{accountId}` key.
 
 ### Packet Design Rules
 - Do not add client-authoritative semantics to any packet contract.
 - Server→Client packets describe authoritative state — the client visualizes them, not trusts them for game logic.
-- `AoEHitEventPacket` is broadcast (not AoI-filtered) so out-of-range clients still receive kill/SFX feedback.
+- `AoEHitEventPacket` is sent via `SendToInterested` (not guaranteed broadcast) in open-world zones; in Arena mode with `BroadcastFilter` all peers receive it. Do not assume global broadcast in all zone types.
+- `AoEHitEventPacket.HitEntityId` is the correct field name — not `TargetId`. Do not confuse with `CombatEventPacket.TargetId`.
 - `EntitySpawnPacket` and `EntityDespawnPacket` are lifecycle signals; the Unity client drives entity creation/destruction from them.
 - `PlayerDeathPacket` and `PlayerRespawnPacket` drive the client respawn UI; the server's respawn timer is authoritative.
+- `PlayerGraceDisconnectPacket` / `PlayerReconnectedPacket` drive disconnected-player UI indicators; they do not remove the entity from the world.
   - Both client and server dequantize via `value / 127f` — guaranteed identical math on all platforms.
   - This eliminates per-platform FP normalization drift (ARM vs x86 auto-vectorization, FMA fusing).
   - `sbyte` has no NaN/Inf; finite-value guards are unnecessary for these fields.
@@ -131,11 +140,29 @@ Do not move authoritative validation into SharedLibrary data alone; data describ
 - For new mechanics, include enough parameters for server-side enforcement.
 - For faction-sensitive behavior, include explicit targeting/visibility fields when needed.
 
+## Shared Value Types
+
+### `WorldBounds` (`readonly struct`)
+- Fields: `float MinX, MaxX, MinY, MaxY`.
+- Constructor: `WorldBounds(float halfX, float halfY)` — sets MinX/MinY to `-halfX`/`-halfY`, MaxX/MaxY to `+halfX`/`+halfY`.
+- `static readonly DefaultArena = new WorldBounds(50f, 50f)` — 100×100 unit arena.
+- Used by `CombatMath.Move` and `InputSanitizer` for out-of-bounds coordinate rejection.
+- Do not replace with a mutable class or add server-only logic into this type.
+
+### `StatModifier` (`struct`, GameServer-only but defined for cross-system use)
+- Fields: `float MaxHealth, AttackPower, PhysAbsorb, PhysResist, MagAbsorb, MagResist, CritChance, MeleeLifeSteal, ProjectileRangeBonus; int ProjectilePierceBonus`.
+- `bool HasAnyValue` — true if any field is non-zero; gates the `RecomputeStats` iteration check.
+- `static readonly Zero` — default empty modifier.
+- All fields are additive deltas, not multipliers; they are summed on top of base stats during `RecomputeStats`.
+- Do not store a `StatModifier` on SharedLibrary packet types; it is a server-side accumulation structure only.
+
 ## CombatMath Rules
 - CombatMath should remain pure and stateless.
 - No hidden RNG state inside SharedLibrary.
 - Keep methods allocation-free and side-effect-free.
 - Favor methods that avoid unnecessary sqrt in hot paths where possible.
+- `CombatMath.ArenaBoundsHalf` has been **removed**. Do not re-introduce this constant; bounds are now injected via `WorldBounds` at call-site.
+- `CombatMath.Move(Vec2 current, float inputX, float inputY, float deltaTime, in WorldBounds bounds, float speed = DefaultMoveSpeed)` — the `in WorldBounds bounds` parameter replaces the old hardcoded arena bounds. Always pass `_zone.Bounds` from `ZoneDescriptor`.
 
 ## CombatMath.CalculateDamage Contract
 Current signature:
@@ -190,8 +217,11 @@ Physical/Magic:
 - CombatMath remains pure and allocation-free.
 - AuthTicketPacket and action intent packet changes preserve anti-replay and auth compatibility assumptions.
 - `CombatMath.CalculateDamage` signature still includes `DamageType`, `absorbPercent`, `resistPercent`, `pierceChance`, `pierceRoll` — do not collapse back to flat-armor form.
+- `CombatMath.Move` takes `in WorldBounds bounds` — do not revert to hardcoded constant or remove the parameter.
 - `SpellDefinition.PierceChance` (float 0–1) and `BasePierceCount` (int) both present and semantically distinct.
 - New lifecycle packets (`EntitySpawnPacket`, `EntityDespawnPacket`, `PlayerDeathPacket`, `PlayerRespawnPacket`, `MatchEndPacket`) not repurposed for game-logic authority.
+- `AoEHitEventPacket` references `HitEntityId`, not `TargetId`.
+- New ground-item / inventory packets sent only to interested or owning-peer audiences as documented in the catalogue.
 
 ## PR Gate Checklist
 - GameServer and SharedLibrary compile after contract edits.

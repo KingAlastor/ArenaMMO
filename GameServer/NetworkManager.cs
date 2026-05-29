@@ -71,11 +71,14 @@ namespace GameServer
             _processor = new NetPacketProcessor();
 
             // Register every Client → Server packet type with its handler
-            _processor.SubscribeReusable<PlayerInputPacket,      NetPeer>(OnPlayerInput);
-            _processor.SubscribeReusable<AttackRequestPacket,    NetPeer>(OnAttackRequest);
-            _processor.SubscribeReusable<SpellCastRequestPacket, NetPeer>(OnSpellCastRequest);
-            _processor.SubscribeReusable<ShootRequestPacket,     NetPeer>(OnShootRequest);
-            _processor.SubscribeReusable<AuthTicketPacket,       NetPeer>(OnAuthTicket);
+            _processor.SubscribeReusable<PlayerInputPacket,         NetPeer>(OnPlayerInput);
+            _processor.SubscribeReusable<AttackRequestPacket,       NetPeer>(OnAttackRequest);
+            _processor.SubscribeReusable<SpellCastRequestPacket,    NetPeer>(OnSpellCastRequest);
+            _processor.SubscribeReusable<ShootRequestPacket,        NetPeer>(OnShootRequest);
+            _processor.SubscribeReusable<AuthTicketPacket,          NetPeer>(OnAuthTicket);
+            _processor.SubscribeReusable<GearSetSwapRequestPacket,  NetPeer>(OnGearSetSwapRequest);
+            _processor.SubscribeReusable<EquipItemRequestPacket,          NetPeer>(OnEquipItemRequest);
+            _processor.SubscribeReusable<GroundItemPickupRequestPacket,     NetPeer>(OnGroundItemPickupRequest);
 
             _net = new NetManager(this) { AutoRecycle = true };
             _net.Start(port);
@@ -109,6 +112,46 @@ namespace GameServer
             _sharedWriter.Reset();
             _processor.Write(_sharedWriter, packet);
             peer.Send(_sharedWriter, method);
+        }
+
+        /// <summary>
+        /// Serialises <paramref name="packet"/> once and sends it only to viewers whose
+        /// <see cref="IInterestFilter.ShouldReceive"/> test passes.
+        ///
+        /// WHY THIS METHOD EXISTS:
+        ///   In Arena mode every combat event is relevant to all 10–20 players, so using
+        ///   SendToAll is fine.  In an open-world MMO zone with 200 players the same approach
+        ///   produces O(N²) traffic — a single combat event would be sent to players on the
+        ///   other side of the continent.  By routing through IInterestFilter the caller can
+        ///   swap in a RadiusFilter (or a spatial-hash filter) without touching ArenaInstance.
+        ///
+        ///   The packet is serialised into _sharedWriter exactly once before the loop starts;
+        ///   the raw bytes are then forwarded to each qualifying peer, avoiding per-peer
+        ///   re-serialisation overhead at high player counts.
+        ///
+        ///   Peers with a null connection (grace-period disconnected players) are skipped so
+        ///   no writes are attempted on dead sockets — the guard is here because ArenaInstance
+        ///   iterates _players which may include ghost sessions awaiting rejoin.
+        /// </summary>
+        public void SendToInterested<T>(
+            T packet,
+            DeliveryMethod method,
+            SharedLibrary.Vec2 eventOrigin,
+            IInterestFilter filter,
+            IReadOnlyList<PlayerSession> viewers)
+            where T : class, new()
+        {
+            _sharedWriter.Reset();
+            _processor.Write(_sharedWriter, packet);
+
+            for (int i = 0; i < viewers.Count; i++)
+            {
+                PlayerSession viewer = viewers[i];
+                // Skip ghost sessions whose peer was cleared on disconnect.
+                if (viewer.Peer == null) continue;
+                if (!filter.ShouldReceive(viewer, eventOrigin)) continue;
+                viewer.Peer.Send(_sharedWriter, method);
+            }
         }
 
         // ── INetEventListener ─────────────────────────────────────────────────
@@ -167,6 +210,15 @@ namespace GameServer
 
         private void OnShootRequest(ShootRequestPacket packet, NetPeer peer)
             => _arena.EnqueueShoot(peer, packet);
+
+        private void OnGearSetSwapRequest(GearSetSwapRequestPacket packet, NetPeer peer)
+            => _arena.EnqueueGearSetSwap(peer, packet);
+
+        private void OnEquipItemRequest(EquipItemRequestPacket packet, NetPeer peer)
+            => _arena.EnqueueEquipItem(peer, packet);
+
+        private void OnGroundItemPickupRequest(GroundItemPickupRequestPacket packet, NetPeer peer)
+            => _arena.EnqueueItemPickup(peer, packet);
 
         private void OnAuthTicket(AuthTicketPacket packet, NetPeer peer)
         {

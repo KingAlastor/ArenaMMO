@@ -88,6 +88,33 @@ namespace SharedLibrary
     }
 
     /// <summary>
+    /// Sent when the player wants to activate one of their pre-loaded gear sets.
+    /// SetIndex must be 0 or 1 and must correspond to a gear set that was pre-loaded from Redis.
+    /// Gear swaps are always permitted; the old respawn-window restriction has been removed now
+    /// that an inventory system is in place.
+    /// </summary>
+    public class GearSetSwapRequestPacket
+    {
+        public byte SetIndex { get; set; }  // 0 = primary set, 1 = alternate set
+    }
+
+    /// <summary>
+    /// Sent when the player equips or unequips an individual item from their inventory.
+    /// Equip: set ItemInstanceId to the item's InstanceId. The server derives the target
+    /// slot from the item definition — the client cannot override slot assignment.
+    /// Unequip: set ItemInstanceId to 0 and Slot to the slot to clear.
+    /// Always honoured — gear changes are permitted at any time now that an inventory system
+    /// is in place; the old respawn-window restriction has been removed.
+    /// </summary>
+    public class EquipItemRequestPacket
+    {
+        /// <summary>InstanceId of the item to equip. 0 = unequip the specified Slot.</summary>
+        public int      ItemInstanceId { get; set; }
+        /// <summary>Only used when ItemInstanceId == 0 to identify which slot to clear.</summary>
+        public EquipSlot Slot          { get; set; }
+    }
+
+    /// <summary>
     /// Sent once after connection to prove lobby-issued identity and authorization.
     /// Signature is HMAC-SHA256 over canonical ticket fields (without Signature).
     /// </summary>
@@ -270,12 +297,111 @@ namespace SharedLibrary
     }
 
     /// <summary>
+    /// Sent only to the owning client after the server applies a gear set swap.
+    /// Carries the full authoritative stat snapshot so the client can update its HUD and
+    /// character sheet without needing to re-request stats.
+    /// </summary>
+    public class PlayerStatsRefreshedPacket
+    {
+        public byte  ActiveGearSetIndex    { get; set; }
+        public float MaxHealth             { get; set; }
+        public float AttackPower           { get; set; }
+        public float PhysicalAbsorbPercent { get; set; }
+        public float PhysicalResistPercent { get; set; }
+        public float MagicAbsorbPercent    { get; set; }
+        public float MagicResistPercent    { get; set; }
+        public float CritChance            { get; set; }
+        public float MeleeLifeStealPercent { get; set; }
+    }
+
+    /// <summary>
     /// Broadcast once when the win condition is satisfied. WinnerFaction maps to FactionId.
     /// The server shuts down after sending this packet.
     /// </summary>
     public class MatchEndPacket
     {
         public byte WinnerFaction { get; set; }
+    }
+
+    // ── Ground-item Packets ───────────────────────────────────────────────────
+
+    /// <summary>Client → Server: player wants to pick up a ground item by its server-assigned ID.</summary>
+    public class GroundItemPickupRequestPacket
+    {
+        public int GroundItemId { get; set; }
+    }
+
+    /// <summary>
+    /// Server → All: a lootable item has appeared on the ground.
+    /// The client uses DefinitionId to look up the item icon and name.
+    /// InstanceId is included so the client can display stack counts for stackable items.
+    /// </summary>
+    public class GroundItemSpawnedPacket
+    {
+        public int   GroundItemId { get; set; }
+        public int   DefinitionId { get; set; }
+        public float X            { get; set; }
+        public float Y            { get; set; }
+    }
+
+    /// <summary>
+    /// Server → All (interested): a ground item was picked up or despawned.
+    /// Clients destroy the world-object for this GroundItemId on receipt.
+    /// </summary>
+    public class GroundItemRemovedPacket
+    {
+        public int GroundItemId { get; set; }
+    }
+
+    /// <summary>
+    /// Server → owning client: confirms that an item was added to the player's inventory.
+    /// Sent in addition to <see cref="GroundItemRemovedPacket"/> after a successful pickup.
+    /// The client adds the item to its inventory panel on receipt.
+    /// </summary>
+    public class ItemAddedToInventoryPacket
+    {
+        public int DefinitionId { get; set; }
+        public int InstanceId   { get; set; }
+    }
+
+    // ── Session continuity packets ──────────────────────────────────────────────
+
+    /// <summary>
+    /// Server → All: a player's UDP connection dropped but their session is preserved
+    /// for up to the grace-period window (default 5 minutes).  Their entity remains in the
+    /// world as a stationary target; the client should display a disconnected indicator.
+    ///
+    /// If the player reconnects within the grace period they receive
+    /// <see cref="PlayerReconnectedPacket"/> and resume normally.
+    /// If the grace period expires they receive <see cref="EntityDespawnPacket"/> instead.
+    /// </summary>
+    public class PlayerGraceDisconnectPacket
+    {
+        public int EntityId { get; set; }
+    }
+
+    /// <summary>
+    /// Server → All: a player who was in the grace-period window has successfully reconnected.
+    /// The client removes any disconnected indicator and resumes treating the entity as live.
+    /// </summary>
+    public class PlayerReconnectedPacket
+    {
+        public int EntityId { get; set; }
+    }
+
+    // ── Arena end-of-match reward packets ──────────────────────────────────────
+
+    /// <summary>
+    /// Server → owning client: sent at Arena match end with the crafting ingredient rewards
+    /// the player has earned.  Items picked up during the match do NOT persist in Arena mode;
+    /// rewards are always crafting ingredients added to the character's crafting pouch.
+    ///
+    /// Format: comma-separated "ingredientId:quantity" pairs, e.g. "1:3,5:1".
+    /// The ProfileServer claims these from Redis key <c>crafting-reward:{accountId}</c>.
+    /// </summary>
+    public class CraftingRewardPacket
+    {
+        public string RewardsCsv { get; set; } = string.Empty;
     }
 
     // ── Lobby Packets ─────────────────────────────────────────────────────────

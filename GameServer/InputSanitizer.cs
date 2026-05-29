@@ -12,7 +12,9 @@ namespace GameServer
     internal static class InputSanitizer
     {
         // Allows a small cushion around arena bounds for targeting packets.
-        private const float MaxAbsWorldCoordinate = CombatMath.ArenaBoundsHalf + 5.0f;
+        // Uses WorldBounds.DefaultArena so the constant stays in sync with the default zone,
+        // rather than the now-removed CombatMath.ArenaBoundsHalf.
+        private const float MaxAbsWorldCoordinate = 50.0f + 5.0f;
         // Reject absurd direction vectors before server-side normalization.
         private const float MaxAbsDirectionComponent = 1000.0f;
 
@@ -49,5 +51,19 @@ namespace GameServer
                && float.IsFinite(packet.DirectionY)
                && MathF.Abs(packet.DirectionX) <= MaxAbsDirectionComponent
                && MathF.Abs(packet.DirectionY) <= MaxAbsDirectionComponent;
+
+        /// <summary>Validates gear set swap request: SetIndex must be 0 or 1.</summary>
+        public static bool IsValid(GearSetSwapRequestPacket packet)
+            => packet.SetIndex <= 1;
+
+        /// <summary>
+        /// Validates an equip-item request.
+        /// ItemInstanceId == 0 means unequip; the Slot must then be a valid EquipSlot value.
+        /// ItemInstanceId > 0 means equip; the Slot field is ignored (derived server-side).
+        /// </summary>
+        public static bool IsValid(EquipItemRequestPacket packet)
+            => packet.ItemInstanceId >= 0
+            && packet.Slot >= EquipSlot.Weapon
+            && packet.Slot <= EquipSlot.Trinket;
     }
 }

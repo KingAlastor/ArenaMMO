@@ -48,21 +48,24 @@ This skill defines the gameplay and networking invariants Copilot must preserve 
 - Ticket validation must include all of: shape checks, clock-window checks, HMAC verification, nonce replay protection, and allowed-spell parsing.
 - Canonical ticket serialization field order is protocol-critical; do not reorder fields without coordinated lobby/client/server rollout.
 - Nonce replay protection must remain server-side and enforced before peer becomes authoritative in match state.
+- `TryValidateForRejoin` is a secondary validation path that skips **only** nonce replay. It is called exclusively after `ArenaInstance` confirms the AccountId is in the grace-period set — a server-side check. HMAC and clock-window are still verified. Do not call it for first-time connections; that would defeat replay protection entirely.
 
 ## Simulation Model
 - Fixed tick loop at 30 Hz in ArenaInstance.
 - Tick order matters and should stay stable:
-  1. Movement input (consume latest PlayerInputPacket per peer, normalize, apply)
+  1. Movement input (consume latest PlayerInputPacket per peer, normalize, apply via `MovementSystem.ProcessInput(player, input, DeltaTime, _zone.Bounds)`)
   2. Record position history — call `PlayerSession.RecordPositionHistory(_tick)` on every player immediately after movement
   3. Melee attacks
   4. Spell casts — drains spell queue; emits `CombatEventPacket` (via `_reusableSpellEvents`) and `AoEHitEventPacket` (via `_reusableAoEHitEvents`)
   5. Shoot/projectile spawn
   6. Projectile tick and resolution
-  7. Status effect tick processing (periodic effects)
-  8. Death detection — set `IsRespawning`, increment `DeathCount`/`KillCount`, broadcast `PlayerDeathPacket`
-  9. Respawn countdown — call `TickRespawn` per player; broadcast `PlayerRespawnPacket` on return true
-  10. Win-condition check — call `CheckWinCondition()` guarded by `_matchEnded`
-  11. Broadcast snapshots/events
+  7. Status effect tick processing — `TickStatusEffects` returns `bool statsChanged`; if `true` AND `player.Peer != null`, send `BuildStatsPacket()` to that peer
+  8. Death detection — set `IsRespawning`, increment `DeathCount`/`KillCount`, broadcast `PlayerDeathPacket` via `SendToInterested`
+  9. Respawn countdown — call `TickRespawn` per player; broadcast `PlayerRespawnPacket` via `SendToInterested` on return `true`
+  10. Equip / gear-set swap — no respawn-window gate; always permitted; ownership validation inside `TryEquipItem`/`TryUnequipSlot`/`TryApplyGearSet`
+  11. Ground item pickups — distance check ≤ 2 units, inventory size cap, `PickupItem`, `GroundItemRemovedPacket` via `SendToInterested`
+  12. Win-condition check — delegates to `_zone.WinCondition.Evaluate(_players, _tick)` (returns `FactionId?`); guarded by `_matchEnded`
+  13. Broadcast snapshots/events
 - Maintain deterministic, server-first sequencing wherever possible.
 
 ## Tick-Order Contract
@@ -71,9 +74,58 @@ If a change affects one phase, validate the neighboring phases still operate cor
 - Position history snapshot before combat validations — lag-compensation rewind depends on fresh history.
 - Spell/projectile spawning before projectile movement resolution.
 - Status periodic ticks after direct-hit damage resolution.
+- Equip/swap after respawn countdown — stat change takes effect at the correct health baseline.
+- Ground item pickups after equip — ensures inventory-size cap reflects any just-equipped items.
 - Snapshot broadcasts after authoritative state mutation is complete for the tick.
 
-## Performance Constraints
+## Equip & Gear System
+- `TryEquipItem`, `TryUnequipSlot`, and `TryApplyGearSet` no longer accept an `isPermitted` parameter. Gear changes are always permitted; the old respawn-window gate has been removed.
+- Ownership validation (item must exist in `_inventory`) is the only gate inside these methods.
+- All three methods call `RecomputeStats()` and return a `PlayerStatsRefreshedPacket` via `BuildStatsPacket()`. Always send that packet to the owning peer after a successful call.
+- Do not re-add a respawn-window gate. If you need a timed restriction, use a `ZoneDescriptor` strategy.
+
+## Stat Computation Model (`RecomputeStats`)
+- `RecomputeStats` is called on all stat-affecting mutations: equip, unequip, gear-set swap, stat-buff apply, stat-buff expiry, zone modifier change.
+- Three layers are summed in order:
+  1. **Base stats** — set once from `HydrateFromProfile`.
+  2. **Equipped items** — iterate `_equippedItems`; prefer `ItemInstance.CraftedStats` over archetype definition stats.
+  3. **Active status-effect stat modifiers** — iterate `_statusEffects`; sum only those where `StatMod.HasAnyValue == true`.
+  4. **Zone stat modifier** — single `_zoneStatModifier` field; set via `SetZoneStatModifier(modifier)` (pass `StatModifier.Zero` to clear).
+- **Proportional HP scaling**: when `MaxHealth` changes, current `Health` is scaled by `Health * (newMaxHealth / oldMaxHealth)` so equipping a +50 HP item also adds 50 to current health. This is intentional; do not revert to a simple clamp.
+- `BuildStatsPacket()` (public) constructs the authoritative `PlayerStatsRefreshedPacket`. Call it after any `RecomputeStats()` invocation to send the updated stats to the player's peer.
+
+## Status Effects
+- `TryApplyStatusEffect` handles DoT/HoT effects with no stat change. Its signature is unchanged.
+- `TryApplyStatBuff` handles temporary pure-stat modifiers (consumables, spell buffs, passive auras). It calls `TryApplyStatusEffect` internally and then writes `StatMod` into the effect, then calls `RecomputeStats()`.
+- `TickStatusEffects` returns `bool statsChanged`. If `true`, `ArenaInstance` must send `BuildStatsPacket()` to `player.Peer` (if non-null).
+- `ActiveStatusEffect.StatMod` is `StatModifier.Zero` for all standard DoT/HoT effects — no behavior change for existing combat system calls.
+- Do not change `TryApplyStatusEffect`'s signature; `CombatSystem` calls it without stat modifiers.
+
+## Inventory & Ground Items
+- `PlayerSession.PickupItem(item, maxInventorySize)` adds an item to `_inventory` if there is space. Returns `false` if full. The size cap is always passed from `_zone.MaxInventorySize` — clients cannot bypass it.
+- Ground items live in `ArenaInstance._groundItems` (`Dictionary<int, GroundItem>`). Keys are server-assigned IDs; clients can only reference items by these IDs.
+- Pickup resolution: distance check ≤ 2 units squared, inventory-space check, remove from `_groundItems`, call `PickupItem`, send `GroundItemRemovedPacket` via `SendToInterested`, send `ItemAddedToInventoryPacket` to owning peer.
+- In Arena mode (`_zone.IsArenaMode == true`), items picked up during the match are **not persisted**. Only crafting ingredient rewards (computed in `ComputeCraftingRewards`) persist at match end.
+- `SpawnGroundItem(Vec2, ItemInstance)` is the public API for placing loot on the ground.
+
+## Grace-Period Rejoin (Dota2-style Reconnect)
+- When a player disconnects, `OnPlayerDisconnected` sets `session.Peer = null` and stores the session in `_gracePeriodSessions[accountId] = (session, _tick + _zone.RejoinGraceTicks)`.
+- The session remains in `_players` and `_entityMap` as a stationary ghost. Other players can still attack it.
+- `TryAuthenticatePeer` checks `_gracePeriodSessions` first. If the AccountId is in the grace set and the window has not expired, it calls `TryValidateForRejoin` (HMAC + expiry, skips nonce replay) and then `OnPlayerRejoined`.
+- `OnPlayerRejoined` reattaches the peer, re-registers in `_peerMap`, removes from `_gracePeriodSessions`, and sends `PlayerReconnectedPacket` to all peers.
+- `EvictExpiredGracePeriods()` runs every `TickRate` ticks. It removes expired sessions from `_players`, `_entityMap`, and `_gracePeriodSessions`, then sends `EntityDespawnPacket`.
+- `PlayerGraceDisconnectPacket` is sent to all peers on disconnect (client shows disconnected indicator).
+- `PlayerReconnectedPacket` is sent to all peers on successful rejoin.
+- Do not remove the grace-period logic — it is an explicit product requirement.
+
+## Heartbeat & Zone Handoff (DataLayer)
+- `MatchDataService.Sink` (`PlayerStateSink`) writes `live-state:{accountId}` to Redis with a 2-hour TTL.
+- `FlushAllPlayerStates()` fires every 60 s (every `TickRate * 60` ticks) from `RunGameLoop`. It is fire-and-forget — `_ = Sink.FlushAsync(...)` — and never blocks the tick loop.
+- In Arena mode, `TakeSnapshot(includeInventory: false)` is passed because Arena pickups are match-scoped.
+- In MMO zones, `TakeSnapshot(includeInventory: true)` includes the full inventory.
+- Zone handoffs publish a `ZoneTransferPayload` to Redis Pub/Sub channel `zone-transfer:{targetZoneId}`. The target zone pre-warms the session from the payload's `LivePlayerState`.
+- `CraftingIngredientReward[]` is written to Redis key `crafting-reward:{accountId}` by `SaveMatchResultAsync` at Arena match end. The ProfileServer claims this key to credit the player's ingredient pouch.
+- Do not add SQL calls to any path that runs during the tick loop.
 - Keep hot paths allocation-light.
 - Avoid LINQ in per-tick logic.
 - Prefer for-loops and reusable lists/buffers.
@@ -98,16 +150,32 @@ If a change affects one phase, validate the neighboring phases still operate cor
   - Only entries where the IP is neither currently banned nor carrying a nonzero violation score are removed.
   - Do not remove this eviction path; without it an IPv6-spoofed unique-source-address flood grows the dictionary without bound.
 
+## Zone Architecture
+- `ZoneDescriptor` is injected into `ArenaInstance` at construction. It is the single source of truth for:
+  - `Bounds` (`WorldBounds`) — used by `MovementSystem.ProcessInput` for clamping.
+  - `ViewRadius` / `ViewRadiusSqr` — used by `BroadcastState` for AoI culling.
+  - `FactionSpawnPoints` — replaces the old hardcoded `SpawnAlpha`/`SpawnBeta` statics.
+  - `WinCondition` (`IWinCondition`) — `EliminationWinCondition` for Arena; `NoWinCondition.Instance` for MMO zones.
+  - `EventFilter` (`IInterestFilter`) — `BroadcastFilter.Instance` for Arena; `RadiusFilter(r)` for large zones.
+  - `MaxInventorySize` — enforced server-side on ground-item pickup via `PickupItem(item, _zone.MaxInventorySize)`.
+  - `IsArenaMode` — controls whether `TakeSnapshot` includes inventory (`false` in Arena, `true` in MMO).
+  - `RejoinGraceTicks` — how long a disconnected ghost session is preserved (default 9000 = 5 min at 30 Hz).
+- Do not add new mode branches to `ArenaInstance` for Arena vs. MMO logic. Use `ZoneDescriptor` fields and strategy interfaces instead.
+- Pass `new ZoneDescriptor()` in `Program.cs` for the default Arena configuration.
+
 ## Player and Faction Rules
 - Every PlayerSession has a Faction.
 - Friendly/allied behavior is faction-based.
 - Hostile behavior targets enemies unless explicitly configured otherwise.
+- `PlayerSession.Peer` may be `null` for grace-period ghost sessions. Always null-check `Peer` before calling `SendTo`. `BroadcastState` and `SendToInterested` already guard for this — do not bypass them.
 
 ## State Replication Rules
 - Position and health are intentionally separated:
   - EntityPositionPacket is sent broadly.
   - EntityHealthPacket is sent only to allied viewers.
 - Do not reintroduce combined position+health packets that leak hidden health data.
+- `BroadcastState` skips viewers with `Peer == null` (grace-period disconnected players) to avoid null-socket writes.
+- All combat-event and state-update broadcasts route through `NetworkManager.SendToInterested<T>` with the zone's `EventFilter`. In Arena mode `BroadcastFilter.Instance` passes all peers (identical behavior to `SendToAll`). In open-world zones a `RadiusFilter` limits traffic. Do not call `SendToAll` for combat events — use `SendToInterested`.
 
 ## Visibility Contract
 - Allied-only visibility must be enforced by recipient filtering, not by "masked values" when possible.
@@ -259,27 +327,77 @@ raw = baseDamage × attackPower
   - Must only be called once per death; the phase-8 guard is `p.Health <= 0f && !p.IsRespawning`.
 - `PlayerSession.TickRespawn(Vec2 spawnPoint)` decrements the countdown each tick.
   - Returns `true` exactly once on the tick the player re-enters play.
-  - When returning `true`, the caller broadcasts `PlayerRespawnPacket`.
+  - When returning `true`, the caller broadcasts `PlayerRespawnPacket` via `SendToInterested`.
 - `IsAlive` is now `Health > 0f && !IsRespawning`.
   - Combat systems check `IsAlive` before resolving hits; a respawning player cannot be targeted.
   - Do not revert `IsAlive` to `Health > 0f` alone; that allows combat resolution against ghosts.
-- Spawn points are faction-based static defaults: `SpawnAlpha = (-30, 0)`, `SpawnBeta = (30, 0)`.
-  - TODO in code: replace with per-map configurable spawn data when the map system is implemented.
+- Spawn points come from `_zone.GetSpawnPoint(faction)` (injected `ZoneDescriptor`).
+  - Do not hardcode `SpawnAlpha`/`SpawnBeta` — those static constants have been removed.
 
 ## Match Lifecycle Contract
-- `ArenaInstance` constructor signature is `ArenaInstance(string ticketSecret, MatchDataService? dataService = null)`.
+- `ArenaInstance` constructor signature is `ArenaInstance(string ticketSecret, ZoneDescriptor zone, MatchDataService? dataService = null)`.
+  - `zone` configures all map topology and rules; pass `new ZoneDescriptor()` for default Arena mode.
   - `dataService` is optional for unit-test contexts that don't need persistence.
-- `_matchEnded` flag gates `CheckWinCondition()` in phase 10; once true it prevents repeat end-match broadcasts.
+- `_matchEnded` flag gates `CheckWinCondition()` in phase 12; once true it prevents repeat end-match broadcasts.
 - `EndMatch(FactionId winner)` must:
   1. Set `_matchEnded = true` and `_isRunning = false` (stops the tick loop).
   2. Broadcast `MatchEndPacket` to all peers.
-  3. Fire `SaveMatchResultAsync` for each session (fire-and-forget).
-- `CheckWinCondition()` checks if all surviving players belong to a single faction (elimination rule).
-  - TODO in code: replace with objective-based win logic when map data is implemented.
-  - Does not trigger on an empty match (no living players at all) until at least one death has occurred.
+  3. Compute `CraftingIngredientReward[]` per player via `ComputeCraftingRewards`.
+  4. Send `CraftingRewardPacket` to each non-null peer that earned rewards.
+  5. Fire `SaveMatchResultAsync` for each session (fire-and-forget); `MatchResult.CraftingRewards` carries the rewards so the ProfileServer can credit them.
+- `CheckWinCondition()` delegates to `_zone.WinCondition.Evaluate(_players, _tick)` which returns `FactionId?`.
+  - `EliminationWinCondition` (default): all surviving players belong to one faction.
+  - `NoWinCondition.Instance`: always returns `null` (for MMO open-world zones).
 - Entity lifecycle:
   - `OnPlayerAuthenticated`: broadcast `EntitySpawnPacket` to all connected peers; back-fill all existing entities to the new peer.
-  - `OnPlayerDisconnected`: broadcast `EntityDespawnPacket` to all remaining peers; use `RemovePlayerFromList` for O(1) removal.
+  - `OnPlayerDisconnected`: set `Peer = null`, store in `_gracePeriodSessions`; send `PlayerGraceDisconnectPacket` to all. **Do not** call `RemovePlayerFromList` here — the ghost session must remain in `_players`.
+  - Grace expiry (`EvictExpiredGracePeriods`): removes session from `_players`, `_entityMap`, `_gracePeriodSessions`; broadcasts `EntityDespawnPacket`.
+  - Rejoin (`OnPlayerRejoined`): reattaches peer; removes from `_gracePeriodSessions`; sends `PlayerReconnectedPacket` to all.
+
+## Equip & Gear System
+- `TryEquipItem`, `TryUnequipSlot`, and `TryApplyGearSet` no longer accept an `isPermitted` parameter. Gear changes are always permitted.
+- Ownership validation (item must exist in `_inventory`) is the only gate inside these methods.
+- All three return a `PlayerStatsRefreshedPacket` via the renamed public `BuildStatsPacket()`. Always send that packet to the owning peer after a successful call (guard `Peer != null`).
+- Do not re-add a respawn-window gate. If timed restrictions are needed, use a `ZoneDescriptor` strategy.
+
+## Stat Computation Model (`RecomputeStats`)
+- `RecomputeStats` is called on all stat-affecting mutations: equip, unequip, gear-set swap, stat-buff apply/expiry, zone modifier change.
+- Three layers are summed in order:
+  1. **Base stats** — set once from `HydrateFromProfile`.
+  2. **Equipped items** — iterate `_equippedItems`; prefer `ItemInstance.CraftedStats` over archetype definition stats.
+  3. **Active status-effect stat modifiers** — iterate `_statusEffects`; sum only those where `StatMod.HasAnyValue == true`.
+  4. **Zone stat modifier** — single `_zoneStatModifier` field; set via `SetZoneStatModifier(modifier)` (pass `StatModifier.Zero` to clear).
+- **Proportional HP scaling**: when `MaxHealth` changes, current `Health` is scaled by `Health * (newMaxHealth / oldMaxHealth)`. Do not revert to a simple clamp.
+- `BuildStatsPacket()` (public) constructs the `PlayerStatsRefreshedPacket`. The old `BuildStatsRefreshedPacket(byte gearSetIndex)` was removed — use `BuildStatsPacket()` instead.
+
+## Status Effects (extended)
+- `TryApplyStatusEffect` handles DoT/HoT effects with no stat change. Signature unchanged.
+- `TryApplyStatBuff` handles temporary pure-stat modifiers. It calls `TryApplyStatusEffect` internally, writes `StatMod` into the effect, then calls `RecomputeStats()`. Returns `PlayerStatsRefreshedPacket?` as an `out` param.
+- `TickStatusEffects` now returns `bool statsChanged`. If `true` AND `player.Peer != null`, `ArenaInstance` sends `BuildStatsPacket()` to that peer after the loop.
+- `ActiveStatusEffect.StatMod` is `StatModifier.Zero` for all standard DoT/HoT effects — no behavior change for existing combat system calls.
+- Do not change `TryApplyStatusEffect`'s signature; `CombatSystem` calls it without stat modifiers.
+
+## Inventory & Ground Items
+- `PlayerSession.PickupItem(item, maxInventorySize)` adds an item to `_inventory`. Returns `false` if full. Always pass `_zone.MaxInventorySize`.
+- Ground items live in `ArenaInstance._groundItems` (`Dictionary<int, GroundItem>`), keyed by server-assigned IDs.
+- Pickup resolution: distance ≤ 2 units (squared 4f), inventory-space check, remove from `_groundItems`, `PickupItem`, `GroundItemRemovedPacket` via `SendToInterested`, `ItemAddedToInventoryPacket` to owning peer.
+- In Arena mode, items picked up during the match are **not persisted**. Only `CraftingIngredientReward[]` written by `SaveMatchResultAsync` persists.
+- `SpawnGroundItem(Vec2, ItemInstance)` is the public API for placing loot on the ground.
+
+## Grace-Period Rejoin
+- Disconnect: `session.Peer = null`, stored in `_gracePeriodSessions`, `PlayerGraceDisconnectPacket` sent to all.
+- Rejoin: `TryAuthenticatePeer` checks grace set; calls `TryValidateForRejoin` (HMAC + expiry, skips nonce replay); then `OnPlayerRejoined`.
+- `OnPlayerRejoined`: reattaches peer, removes from grace set, sends full entity-list sync + `PlayerReconnectedPacket`.
+- Eviction: `EvictExpiredGracePeriods()` runs every `TickRate` ticks; removes expired sessions; sends `EntityDespawnPacket`.
+- `TryValidateForRejoin` must only be called after confirming the AccountId is in the grace set. Never call it for first-time connections.
+
+## Heartbeat & DataLayer
+- `MatchDataService.Sink` (`PlayerStateSink`) writes `live-state:{accountId}` to Redis (2h TTL).
+- `FlushAllPlayerStates()` fires every 60 s in `RunGameLoop` — fire-and-forget, never blocks the tick loop.
+- Arena mode: `TakeSnapshot(includeInventory: false)`. MMO zones: `TakeSnapshot(includeInventory: true)`.
+- Zone handoff: publish `ZoneTransferPayload` to `zone-transfer:{targetZoneId}` after flushing state.
+- `CraftingIngredientReward[]` written to `crafting-reward:{accountId}` at Arena match end by `SaveMatchResultAsync`.
+- Do not call any `MatchDataService` or `PlayerStateSink` method from inside `ProcessTick`.
 
 ## ProjectileState Snapshot Contract
 - `ProjectileState` snapshots `DamageType` and `PierceChance` from the spell at spawn time.
@@ -290,29 +408,34 @@ raw = baseDamage × attackPower
 
 - Server authority still intact for all touched mechanics.
 - Faction visibility still correct for health and status effects.
-- Tick order and phase boundaries unchanged or intentionally documented (movement → history snapshot → combat → death → respawn → win-check → broadcast).
+- Tick order and phase boundaries unchanged or intentionally documented (movement → history snapshot → combat → status ticks → death → respawn → equip → pickup → win-check → broadcast).
 - Position history recorded every tick before combat phase.
 - No new hot-path allocations or LINQ introduced.
-- `_entityMap` kept in sync on connect and disconnect.
-- Reusable list fields cleared before each use; no per-tick `new List<>()` allocations. (Check `_reusableSpellEvents`, `_reusableAoEHitEvents`, `_reusableStatusEffects`.)
+- `_entityMap` kept in sync on connect, disconnect, and grace-period eviction.
+- Reusable list fields cleared before each use; no per-tick `new List<>()` allocations.
 - `ProcessMeleeAttack` and `ProcessSingleTarget` still use historical position for range check.
 - `EntityPositionPacket.ServerTick` and `AcknowledgedTick` still populated in BroadcastState.
 - `PlayerInputPacket` axes remain `sbyte`; dequantization stays `value / 127f`.
 - Packet semantics are still coherent with Unity client expectations.
 - Pre-auth gating, auth timeout, and IP abuse controls still protect connection ingress.
 - IntentGuard still enforces tick skew, replay resistance, and queue pressure limits.
-- `GetHistoricalPosition` still uses `Math.Clamp` with both lower AND upper bounds — do not revert to `Math.Max` (lower-bound only).
-- `DisconnectAuthTimeoutPeers` still uses the pre-allocated `_timedOutPeers` list — no per-call `new List<NetPeer>()`.
-- `_ipGuards` eviction path (`EvictStaleIpGuards`) still wired into the tick loop via `DisconnectAuthTimeoutPeers`.
-- `ProcessSpellCast` still receives `entityMap` for O(1) single-target lookup — `allPlayers` list is not the lookup path for single-target spells.
-- `ProcessSpellCast` receives both `_reusableSpellEvents` and `_reusableAoEHitEvents`; AoE/MeleeSplash fills `aoeResults`, not `results`.
-- Security telemetry still records key drop categories for incident analysis.
-- `PlayerSession.Armor` is gone; any new mitigation stat must follow the absorb/resist/pierce model.
-- `IsAlive` still includes `&& !IsRespawning`; combat systems check `IsAlive` before resolving hits.
-- `TickStatusEffects` receives `_entityMap` (`IReadOnlyDictionary<int, PlayerSession>`) — do not pass `_players` (O(N) scan).
-- `RemovePlayerFromList` is used on disconnect, not `_players.Remove(session)` (O(N) shift).
-- No `MatchDataService` methods are called from within `ProcessTick` or `BroadcastState`.
+- `GetHistoricalPosition` still uses `Math.Clamp` with both lower AND upper bounds — do not revert to `Math.Max`.
+- `DisconnectAuthTimeoutPeers` still uses the pre-allocated `_timedOutPeers` list.
+- `_ipGuards` eviction path (`EvictStaleIpGuards`) still wired into the tick loop.
+- `ProcessSpellCast` still receives `entityMap` for O(1) single-target lookup.
+- `ProcessSpellCast` receives both `_reusableSpellEvents` and `_reusableAoEHitEvents`.
+- Security telemetry still records key drop categories.
+- `PlayerSession.Armor` is gone; new mitigation stats must follow the absorb/resist/pierce model.
+- `IsAlive` still includes `&& !IsRespawning`.
+- `TickStatusEffects` receives `_entityMap` (`IReadOnlyDictionary<int, PlayerSession>`) — do not pass `_players`.
+- `RemovePlayerFromList` is used for grace-period eviction, not on disconnect (ghost must remain).
+- No `MatchDataService`/`PlayerStateSink` methods called from inside `ProcessTick` or `BroadcastState`.
 - `ARENA_TICKET_SECRET` is read from environment, not from `appsettings.json`.
+- `BroadcastState` skips `Peer == null` ghost sessions.
+- All combat events use `SendToInterested` with `_zone.EventFilter`; do not use `SendToAll` for events.
+- `TryEquipItem`/`TryUnequipSlot`/`TryApplyGearSet` called without `isPermitted` parameter.
+- `BuildStatsPacket()` used instead of removed `BuildStatsRefreshedPacket(byte gearSetIndex)`.
+- `TickStatusEffects` return value (`bool statsChanged`) checked; if `true`, `BuildStatsPacket()` sent to peer.
 
 ## PR Gate Checklist
 - Build succeeds for GameServer and SharedLibrary.
@@ -325,6 +448,10 @@ raw = baseDamage × attackPower
 - Damage pipeline changes must go through `CombatMath.CalculateDamage` — no inline damage formulas in combat systems.
 - New mitigation mechanics must follow the absorb→resist→pierce ordering — do not add a fourth stage without documenting it here.
 - Match lifecycle changes (new end conditions, respawn rules) must update this skill file.
+- New stat modifiers must use `StatModifier` struct and flow through `RecomputeStats()` layers.
+- New zone behaviors must be expressed as `ZoneDescriptor` fields or strategies, not `ArenaInstance` mode branches.
+- Any new `PlayerSession` method that changes stats must call `RecomputeStats()` and return `BuildStatsPacket()` to the caller.
+- Grace-period logic must not be bypassed. `TryValidateForRejoin` is only valid after grace-set membership is confirmed.
 
 ## If Extending Mechanics
 When adding new mechanics, preserve these invariants:

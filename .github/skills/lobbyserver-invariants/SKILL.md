@@ -99,6 +99,17 @@ This skill defines the authentication, matchmaking, and ticket-issuance invarian
 - Redis publish failures must be caught and logged but **must not** block or abort ticket dispatch to clients.
 - Do not publish high-frequency positional or simulation data over Redis Pub/Sub. This channel is for orchestration events only.
 
+### Redis Key Schema (cross-server awareness)
+| Key | Written by | Read by | TTL | Purpose |
+|-----|-----------|---------|-----|---------|
+| `live-state:{accountId}` | GameServer (`PlayerStateSink`) | GameServer (zone handoff pre-warm) | 2 h | Heartbeat crash-recovery snapshot + zone transfer payload |
+| `crafting-reward:{accountId}` | GameServer (`MatchDataService.SaveMatchResultAsync`) | ProfileServer (on login/lobby entry) | 24 h | Arena match crafting ingredient rewards pending pickup |
+| `zone-transfer:{targetZoneId}` | GameServer (Redis Pub/Sub publish) | Target GameServer zone | n/a (event) | Zone boundary crossing: `ZoneTransferPayload` (contains `LivePlayerState` + signed ticket) |
+
+- The lobby does **not** write to `crafting-reward:*` or `zone-transfer:*` prefixes. Do not publish to these channels from lobby code.
+- The lobby **may** read `live-state:{accountId}` in future for reconnect flow, but must not write to it.
+- `arena:match-formed` remains a notify-only channel; the GameServer does not subscribe to it for admission control.
+
 ---
 
 ## Lobby Coordination Loop

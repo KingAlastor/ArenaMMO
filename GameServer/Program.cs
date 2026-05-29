@@ -33,5 +33,5 @@ using var dataService = new MatchDataService(redisConn, postgresConn);
 Console.WriteLine($"Initialising arena instance on port {port}...");
 Console.WriteLine("Press Ctrl+C to shut down.\n");
 
-var arena = new ArenaInstance(ticketSecret, dataService);
+var arena = new ArenaInstance(ticketSecret, new ZoneDescriptor(), dataService);
 arena.Start(port);   // Blocks on the 30 Hz game loop until process is killed

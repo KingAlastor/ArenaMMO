@@ -8,12 +8,13 @@ You are helping me build a server-authoritative, high-CCU, instance-based PvP ar
 
 ## 1. Core Architecture & Tech Stack
 
-The system is divided into four separate components:
+The system is divided into five separate components:
 
 1. **The Client (Unity Engine):** Purely a visualizer, handler of UI, animations, audio, interpolation, and client-side prediction.
 2. **The Lobby Server (.NET Core Console App):** Pre-game authentication, matchmaking, faction assignment, and signed AuthTicket issuance. Runs on UDP port 9040 (default).
 3. **The Game Server (.NET Core Console App):** A headless, high-performance "math machine" running a fixed tick-rate simulation loop (default: 30Hz). Runs on UDP port 9050 (default).
-4. **The Shared Library (.NET Standard 2.1 C# Class Library):** Contains network packets (arena and lobby), algebraic math, logic utilities, and combat formulas shared by all components.
+4. **The Profile Server (.NET Core ASP.NET Web App):** Pre-match HTTP REST service for character management (create/list/delete) and crafting. Runs on HTTP port 9060 (default). Has no connection to active matches or Redis.
+5. **The Shared Library (.NET Standard 2.1 C# Class Library):** Contains network packets (arena and lobby), algebraic math, logic utilities, and combat formulas shared by all components.
 
 ### Core Libraries Used:
 * **Networking (Direct Gameplay & Lobby):** `LiteNetLib` (Low-overhead, allocation-optimized UDP).
