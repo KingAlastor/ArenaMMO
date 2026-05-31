@@ -28,6 +28,19 @@ namespace GameServer
         public Vec2  Position    { get; set; }
         public float Health      { get; set; } = 100f;
         public float MaxHealth   { get; set; } = 100f;
+
+        // ── Delta-compression dirty tracking (BroadcastState) ─────────────────
+        // Stores the fixed-point encoded values that were broadcast at the end of
+        // the last tick.  BroadcastState compares current encoded values against
+        // these to suppress identical packets for stationary/full-HP entities.
+        // Initialized to impossible sentinel values so the very first tick always
+        // sends — short.MinValue is outside the valid ±2048 world-unit range.
+        // Updated once per tick in ArenaInstance.CommitBroadcastState() AFTER all
+        // viewers have been iterated, so every viewer in one tick sees a consistent
+        // "changed" / "unchanged" decision for the same entity.
+        internal short  LastBroadcastX      = short.MinValue;
+        internal short  LastBroadcastY      = short.MinValue;
+        internal ushort LastBroadcastHealth = ushort.MaxValue;
         public float AttackPower { get; set; } = 1.0f;  // damage multiplier
 
         // ── Mitigation stats (0–1 fractions) ────────────────────────────────────
@@ -128,7 +141,7 @@ namespace GameServer
         /// </summary>
         public bool TryApplyGearSet(int setIndex, out PlayerStatsRefreshedPacket packet)
         {
-            packet = null!;
+            packet = default;
             if (setIndex < 0 || setIndex >= GearSets.Length) return false;
 
             ApplyGearSetLoadout(setIndex);
@@ -143,7 +156,7 @@ namespace GameServer
         /// </summary>
         public bool TryEquipItem(int instanceId, out PlayerStatsRefreshedPacket packet)
         {
-            packet = null!;
+            packet = default;
             if (instanceId <= 0) return false;
 
             ItemInstance? item = FindInInventory(instanceId);
@@ -160,7 +173,7 @@ namespace GameServer
         /// <summary>Clears the specified equipment slot and recomputes stats.</summary>
         public bool TryUnequipSlot(EquipSlot slot, out PlayerStatsRefreshedPacket packet)
         {
-            packet = null!;
+            packet = default;
 
             _equippedItems.Remove(slot);
             RecomputeStats();
@@ -286,19 +299,19 @@ namespace GameServer
         /// Public so <see cref="ArenaInstance"/> can send it after resolving a
         /// stat-modifying status-effect tick.
         /// </summary>
-        public PlayerStatsRefreshedPacket BuildStatsPacket() =>
-            new PlayerStatsRefreshedPacket
-            {
-                ActiveGearSetIndex    = (byte)ActiveGearSetIndex,
-                MaxHealth             = MaxHealth,
-                AttackPower           = AttackPower,
-                PhysicalAbsorbPercent = PhysicalAbsorbPercent,
-                PhysicalResistPercent = PhysicalResistPercent,
-                MagicAbsorbPercent    = MagicAbsorbPercent,
-                MagicResistPercent    = MagicResistPercent,
-                CritChance            = CritChance,
-                MeleeLifeStealPercent = MeleeLifeStealPercent,
-            };
+        public PlayerStatsRefreshedPacket BuildStatsPacket() => new PlayerStatsRefreshedPacket
+        {
+            PacketTypeId          = PacketId.PlayerStatsRefreshed,
+            ActiveGearSetIndex    = (byte)ActiveGearSetIndex,
+            MaxHealth             = PacketEncoding.EncodeHealth(MaxHealth),
+            AttackPower           = PacketEncoding.EncodeAttackPower(AttackPower),
+            PhysicalAbsorbPercent = PacketEncoding.EncodeStat(PhysicalAbsorbPercent),
+            PhysicalResistPercent = PacketEncoding.EncodeStat(PhysicalResistPercent),
+            MagicAbsorbPercent    = PacketEncoding.EncodeStat(MagicAbsorbPercent),
+            MagicResistPercent    = PacketEncoding.EncodeStat(MagicResistPercent),
+            CritChance            = PacketEncoding.EncodeStat(CritChance),
+            MeleeLifeStealPercent = PacketEncoding.EncodeStat(MeleeLifeStealPercent),
+        };
 
         private ItemInstance? FindInInventory(int instanceId)
         {
@@ -483,7 +496,7 @@ namespace GameServer
             StatusEffectVisibility visibility,
             out StatusEffectAppliedPacket packet)
         {
-            packet = null!;
+            packet = default;
 
             if (effectId <= 0 || durationTicks <= 0)
                 return false;
@@ -504,11 +517,11 @@ namespace GameServer
 
                 packet = new StatusEffectAppliedPacket
                 {
+                    PacketTypeId   = SharedLibrary.PacketId.StatusEffectApplied,
                     TargetEntityId = EntityId,
                     SourceEntityId = sourceEntityId,
                     EffectId       = effectId,
-                    RemainingTicks = existing.RemainingTicks,
-                    Stacks         = existing.Stacks,
+                    RemainingTicks = (short)System.Math.Clamp(existing.RemainingTicks, short.MinValue, short.MaxValue),
                     Visibility     = existing.Visibility,
                 };
 
@@ -531,11 +544,11 @@ namespace GameServer
 
             packet = new StatusEffectAppliedPacket
             {
+                PacketTypeId   = SharedLibrary.PacketId.StatusEffectApplied,
                 TargetEntityId = EntityId,
                 SourceEntityId = sourceEntityId,
                 EffectId       = effectId,
-                RemainingTicks = durationTicks,
-                Stacks         = stacks,
+                RemainingTicks = (short)System.Math.Clamp(durationTicks, short.MinValue, short.MaxValue),
                 Visibility     = visibility,
             };
 
@@ -581,7 +594,7 @@ namespace GameServer
                     {
                         AttackerId = effect.SourceEntityId,
                         TargetId   = EntityId,
-                        Damage     = dotDamage,
+                        Damage     = GameServer.Systems.DamageUtils.ClampAndEncode(dotDamage, effect.SourceEntityId, "dot"),
                         IsCritical = false,
                     });
 
@@ -618,6 +631,7 @@ namespace GameServer
 
                 expiredPackets.Add(new StatusEffectRemovedPacket
                 {
+                    PacketTypeId   = SharedLibrary.PacketId.StatusEffectRemoved,
                     TargetEntityId = EntityId,
                     EffectId       = effectId,
                     Visibility     = effect.Visibility,

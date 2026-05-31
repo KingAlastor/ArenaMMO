@@ -5,12 +5,29 @@ namespace GameServer
     /// <summary>
     /// Live server-side state of one in-flight projectile.
     /// Created when a ShootRequestPacket is validated; removed on hit or range expiry.
-    /// Class (reference type) so mutations inside ProjectileSystem.Tick are in-place.
+    ///
+    /// Struct (value type) stored in a fixed-size pre-allocated array on ArenaInstance.
+    /// This eliminates the heap allocation that occurred each time SpawnProjectile returned
+    /// a new class instance — under sustained fire that was a continuous GC source.
+    ///
+    /// Mutations in ProjectileSystem.Tick use
+    ///   ref ProjectileState proj = ref array[i];
+    /// which gives a managed ref to the array slot, so writes go directly to the array
+    /// element without any copy or additional allocation.
+    ///
+    /// OwnerFaction is snapshotted from the shooter at spawn time so MatchesFactionFilter
+    /// can resolve in O(1) instead of performing an O(N) linear scan of allPlayers.
     /// </summary>
-    public sealed class ProjectileState
+    public struct ProjectileState
     {
         public int   ProjectileId     { get; set; }
         public int   OwnerId          { get; set; }
+        /// <summary>
+        /// Faction of the owner, snapshotted from PlayerSession.Faction at spawn time.
+        /// Used by MatchesFactionFilter for O(1) friendly-fire decisions — avoids the
+        /// O(N) allPlayers scan that would otherwise be needed on every collision check.
+        /// </summary>
+        public FactionId OwnerFaction  { get; set; }
         public int   SpellId          { get; set; }
 
         // Authoritative world position, updated every tick

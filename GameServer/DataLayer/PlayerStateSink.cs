@@ -54,10 +54,25 @@ namespace GameServer.DataLayer
         /// <code>
         ///   _ = _dataService.Sink.FlushAsync(player.TakeSnapshot(!_zone.IsArenaMode));
         /// </code>
-        /// The async machinery queues the write on a thread-pool thread.  The tick loop is
-        /// never blocked because <see cref="IDatabase.StringSetAsync"/> is non-blocking.
+        ///
+        /// IMPORTANT — synchronous work before the first 'await':
+        ///   An 'async' method runs its body synchronously on the CALLER'S thread up to the
+        ///   first 'await'. If FlushAsync were async and did JSON serialization before its
+        ///   first await, that CPU work would run on the game-loop thread — exactly what we
+        ///   must avoid. By returning Task.Run(...) instead, ALL work (string building, JSON
+        ///   serialization, and the Redis send) is queued immediately on a thread-pool thread
+        ///   and the game-loop thread regains control in nanoseconds.
+        ///
+        /// ALLOCATION NOTE:
+        ///   Task.Run allocates one Task and one compiler-generated closure object per call.
+        ///   Both are acceptable on this cold path (at most once per player per 60 seconds).
+        ///   Task.Run has no state-passing overload in .NET; the closure cannot be eliminated
+        ///   without switching to Task.Factory.StartNew(..., state) which boxes LivePlayerState
+        ///   to object — a worse trade-off.  Accept the two allocations here.
         /// </summary>
-        public async Task FlushAsync(LivePlayerState state)
+        public Task FlushAsync(LivePlayerState state) => Task.Run(() => FlushCoreAsync(state));
+
+        private async Task FlushCoreAsync(LivePlayerState state)
         {
             string key   = $"live-state:{state.AccountId}";
             string value = JsonSerializer.Serialize(state, s_jsonOptions);

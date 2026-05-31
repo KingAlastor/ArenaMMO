@@ -11,6 +11,23 @@ using System.Threading;
 
 namespace GameServer
 {
+    // ── Value-type snapshot of one client's movement input ───────────────────
+    // LiteNetLib's SubscribeReusable<T> allocates ONE T instance globally and
+    // overwrites its fields for every inbound packet of that type.  Storing the
+    // class reference in a Dictionary means every dictionary entry points at the
+    // SAME object — the last peer to send input overwrites all earlier entries.
+    //
+    // Fix: copy the three relevant scalar fields into this plain struct immediately
+    // inside EnqueueInput (on the callback thread, before PollEvents returns).
+    // The dictionary then holds independent per-peer value copies, and
+    // MovementSystem.ProcessInput works from those copies each tick.
+    public struct PlayerInputData
+    {
+        public int   TickNumber;
+        public sbyte InputX;
+        public sbyte InputY;
+    }
+
     /// <summary>
     /// Manages one self-contained arena match.
     /// Owns the fixed-tick simulation loop, all PlayerSessions, the NetworkManager,
@@ -44,37 +61,84 @@ namespace GameServer
         private int _nextEntityId = 1;
 
         // Reusable per-tick lists — allocated once, cleared before each use to avoid GC churn.
-        private readonly List<StatusEffectAppliedPacket> _reusableStatusEffects = new List<StatusEffectAppliedPacket>();
-        private readonly List<CombatEventPacket>          _reusableSpellEvents   = new List<CombatEventPacket>();
-        private readonly List<AoEHitEventPacket>          _reusableAoEHitEvents  = new List<AoEHitEventPacket>();
+        // Initial capacity is set to a conservative upper bound for a 20-player AoE fight:
+        //   20 targets × 3 effects each = 60 status effects/tick is the realistic burst ceiling.
+        //   Sizing at 64 (next power of two) ensures the internal array never resizes in practice.
+        private readonly List<StatusEffectAppliedPacket> _reusableStatusEffects = new List<StatusEffectAppliedPacket>(64);
+        private readonly List<CombatEventPacket>          _reusableSpellEvents   = new List<CombatEventPacket>(32);
+        private readonly List<AoEHitEventPacket>          _reusableAoEHitEvents  = new List<AoEHitEventPacket>(32);
 
         // ── Input Queues ──────────────────────────────────────────────────────
         // Filled by network callbacks each tick; drained by ProcessTick().
 
-        private readonly ConcurrentDictionary<NetPeer, PlayerInputPacket> _latestInputByPeer = new();
-        private readonly ConcurrentQueue<(NetPeer Peer, AttackRequestPacket    Packet)> _attackQueue    = new();
-        private readonly ConcurrentQueue<(NetPeer Peer, SpellCastRequestPacket Packet)> _spellQueue     = new();
-        private readonly ConcurrentQueue<(NetPeer Peer, ShootRequestPacket     Packet)> _shootQueue     = new();
-        // Latest-wins: only the most recent swap request per peer is processed each tick,
-        // matching the movement input model to avoid per-peer allocation churn.
-        private readonly ConcurrentDictionary<NetPeer, GearSetSwapRequestPacket> _latestGearSwapByPeer = new();
+        // Latest-wins: only the most recent input per peer is processed each tick.
+        // LiteNetLib callbacks all fire on the game-loop thread (via PollEvents), so a
+        // plain Dictionary is sufficient here — no concurrent access occurs.
+        // Stored as PlayerInputData (struct) — NOT as the PlayerInputPacket class reference.
+        // See PlayerInputData comment above for why the class reference must NOT be stored.
+        private readonly Dictionary<NetPeer, PlayerInputData> _latestInputByPeer = new();
+        // ── Action queues — plain Queue<T>, NOT ConcurrentQueue<T> ───────────────────────
+        // All LiteNetLib callbacks (Enqueue* methods) fire synchronously inside PollEvents(),
+        // which is called from the game-loop thread.  ProcessTick() also runs on the game-loop
+        // thread.  There is therefore zero concurrent access — ConcurrentQueue<T> would only
+        // add interlocked/volatile overhead (an Interlocked.CompareExchange per TryDequeue)
+        // with no correctness benefit.
+        // If packet I/O is ever moved to a dedicated I/O thread, switch back to ConcurrentQueue
+        // or add a spinlock and use a pre-sized ring buffer.
+        private readonly Queue<(NetPeer Peer, AttackRequestPacket    Packet)> _attackQueue    = new(16);
+        private readonly Queue<(NetPeer Peer, SpellCastRequestPacket Packet)> _spellQueue     = new(16);
+        private readonly Queue<(NetPeer Peer, ShootRequestPacket     Packet)> _shootQueue     = new(16);
+        // Latest-wins: same single-thread reasoning as above.
+        private readonly Dictionary<NetPeer, GearSetSwapRequestPacket> _latestGearSwapByPeer = new();
         // Individual item equip/unequip requests — queued so multiple fast requests in one
         // tick are not silently dropped (player may swap several slots quickly).
-        private readonly ConcurrentQueue<(NetPeer Peer, EquipItemRequestPacket Packet)> _equipItemQueue = new();
+        private readonly Queue<(NetPeer Peer, EquipItemRequestPacket Packet)> _equipItemQueue = new(16);
         // Ground item pickup requests — queued for phase-ordered resolution after movement.
-        private readonly ConcurrentQueue<(NetPeer Peer, GroundItemPickupRequestPacket Packet)> _pickupQueue = new();
+        private readonly Queue<(NetPeer Peer, GroundItemPickupRequestPacket Packet)> _pickupQueue = new(16);
         // IntentGuard enforces anti-spam, tick skew, and replay rules before intents enter simulation.
         private readonly IntentGuard _intentGuard = new();
         // Ticket validator is the trust boundary between lobby-issued identity and live arena authority.
         private readonly AuthTicketValidator _ticketValidator;
 
         // ── Projectile State ───────────────────────────────────────────
+        //
+        // ProjectileState is a struct stored in a fixed-capacity array.  This eliminates
+        // the heap allocation that occurred on every SpawnProjectile call when it was a class.
+        // _projectileCount tracks the live-projectile window; slots beyond it are dead.
+        // Mutations inside ProjectileSystem.Tick use ref locals for zero-copy in-place updates.
+        // MaxProjectiles = 512 supports ~17 volleys of 30 arrows simultaneously — tune upward
+        // for denser MMORPG fights; at ~100 B/struct the array occupies ≈ 50 KB on the heap.
+        private const int MaxProjectiles = 512;
+        private readonly ProjectileState[] _projectiles    = new ProjectileState[MaxProjectiles];
+        private int                        _projectileCount = 0;
+        private int                        _nextProjectileId = 1;
 
-        private readonly List<ProjectileState> _projectiles    = new List<ProjectileState>();
-        private int                            _nextProjectileId = 1;
+        // Sized for a 20-player fight where every player has 3 active DoT ticks firing simultaneously.
+        private readonly List<CombatEventPacket>         _statusTickEvents     = new List<CombatEventPacket>(64);
+        private readonly List<StatusEffectRemovedPacket> _expiredStatusEffects = new List<StatusEffectRemovedPacket>(32);
 
-        private readonly List<CombatEventPacket> _statusTickEvents = new List<CombatEventPacket>();
-        private readonly List<StatusEffectRemovedPacket> _expiredStatusEffects = new List<StatusEffectRemovedPacket>();
+        // ── Reusable broadcast packet instances (zero-allocation BroadcastState) ──────
+        // Pre-allocated once and mutated before every SendTo call.  All sends occur on the
+        // single game-loop thread, so no synchronisation is required.
+        private EntityPositionPacket       _posPacket          = new EntityPositionPacket       { PacketTypeId = PacketId.EntityPosition       };
+        private EntityHealthPacket         _healthPacket       = new EntityHealthPacket         { PacketTypeId = PacketId.EntityHealth         };
+        // Pre-allocated for zero-GC projectile lifecycle broadcasts inside ProcessTick.
+        private ProjectileSpawnPacket      _projSpawnPacket    = new ProjectileSpawnPacket      { PacketTypeId = PacketId.ProjectileSpawn      };
+        private ProjectileDestroyPacket    _projDestPacket     = new ProjectileDestroyPacket    { PacketTypeId = PacketId.ProjectileDestroy    };
+        // Pre-allocated for zero-GC event broadcasts inside ProcessTick.
+        // Mutation + in-ref pattern mirrors _posPacket/_projSpawnPacket above.
+        private PlayerDeathPacket          _deathPacket        = new PlayerDeathPacket          { PacketTypeId = PacketId.PlayerDeath          };
+        private PlayerRespawnPacket        _respawnPacket      = new PlayerRespawnPacket        { PacketTypeId = PacketId.PlayerRespawn        };
+        private GroundItemRemovedPacket    _groundRemovedPacket  = new GroundItemRemovedPacket    { PacketTypeId = PacketId.GroundItemRemoved    };
+        private GroundItemSpawnedPacket   _groundSpawnedPacket  = new GroundItemSpawnedPacket   { PacketTypeId = PacketId.GroundItemSpawned    };
+        private ItemAddedToInventoryPacket _itemAddedPacket     = new ItemAddedToInventoryPacket { PacketTypeId = PacketId.ItemAddedToInventory };
+
+        // ── Spatial grid ──────────────────────────────────────────────────────
+        // Lazily created from zone bounds on the first ProcessTick call so the
+        // ZoneDescriptor bounds are guaranteed to be populated.  The grid cell
+        // size is set to the view radius so a 3×3 neighbourhood always covers the
+        // full interest window without iterating all players.
+        private SpatialGrid? _spatialGrid;
 
         // ── Internals ─────────────────────────────────────────────────────────
 
@@ -96,6 +160,21 @@ namespace GameServer
         private int _nextGroundItemId = 1;
 
         private readonly MatchDataService? _dataService;
+
+        // ── Deferred profile hydration ──────────────────────────────────────────
+        // Redis I/O for player profiles must NEVER block the game-loop tick thread.
+        // OnPlayerAuthenticated fires a background Task immediately and enqueues the
+        // (session, task) pair here.  ProcessTick drains completed tasks each tick,
+        // applying the loaded profile with zero blocking latency.
+        // Players use base/default stats for the 1–10 ms it normally takes Redis to
+        // respond — this is imperceptible and vastly preferable to stalling the tick.
+        //
+        // Plain Queue<T> is intentional: all access is on the single game-loop thread
+        // (OnPlayerAuthenticated fires from PollEvents, FinalizeHydration from ProcessTick —
+        // both on the same thread).  ConcurrentQueue<T> would add unnecessary
+        // interlocked/volatile overhead with zero benefit here.
+        private readonly Queue<(PlayerSession Session, System.Threading.Tasks.Task<DataLayer.PlayerProfile?> ProfileTask)>
+            _pendingHydration = new();
 
         // Max individual equip requests drained per tick — prevents a burst of requests from
         // hogging tick time; each request is O(inventory size) which is bounded but non-zero.
@@ -127,6 +206,12 @@ namespace GameServer
         {
             _network   = new NetworkManager(this, port);
             _isRunning = true;
+
+            // Initialise the spatial grid eagerly before the loop starts so ProcessTick never
+            // needs a null check.  ZoneDescriptor.Bounds must be set before calling Start().
+            WorldBounds wb       = _zone.Bounds;
+            float       cellSize = MathF.Max(_zone.ViewRadius, 16f);
+            _spatialGrid = new SpatialGrid(wb.MinX, wb.MinY, wb.MaxX, wb.MaxY, cellSize);
             Console.WriteLine($"[Arena] Instance running at {TickRate} Hz");
             RunGameLoop();
         }
@@ -184,11 +269,18 @@ namespace GameServer
             };
             session.ReplaceAllowedSpells(context.AllowedSpellIds);
 
-            PlayerProfile? profile = _dataService?.LoadPlayerProfile(context.PlayerId);
-            if (profile != null)
-                session.HydrateFromProfile(profile);
-            else
-                session.Health = session.MaxHealth;
+            // ── Deferred Redis hydration (NEVER block the game-loop thread on I/O) ───────
+            // Fire the async Redis read immediately so it starts in the background.
+            // The session enters the match with base/default stats for the 1–10 ms it
+            // normally takes Redis to respond — this is imperceptible to the player.
+            // FinalizeHydration() drains completed tasks each tick with zero blocking.
+            session.Health = session.MaxHealth;   // safe default until profile arrives
+            if (_dataService != null)
+            {
+                System.Threading.Tasks.Task<DataLayer.PlayerProfile?> profileTask =
+                    _dataService.LoadPlayerProfileAsync(context.PlayerId);
+                _pendingHydration.Enqueue((session, profileTask));
+            }
 
             _players.Add(session);
             _peerMap[peer]               = session;
@@ -262,7 +354,8 @@ namespace GameServer
                 return;
 
             _peerMap.Remove(peer);
-            _latestInputByPeer.TryRemove(peer, out _);
+            _latestInputByPeer.Remove(peer);
+            _latestGearSwapByPeer.Remove(peer);
             _intentGuard.OnPeerDisconnected(peer);
 
             // Keep the session alive as a stationary ghost for RejoinGraceTicks ticks.
@@ -310,8 +403,16 @@ namespace GameServer
             if (!_intentGuard.TryAcceptIntent(peer, packet.TickNumber, IntentKind.Input, _tick, _peerMap.ContainsKey(peer)))
                 return;
 
-            // Keep only the latest input per peer to prevent scheduler spam from growing work.
-            _latestInputByPeer[peer] = packet;
+            // Copy the three scalar fields into a value-type struct immediately.
+            // DO NOT store 'packet' directly — it is the single LiteNetLib reusable instance
+            // and its fields will be overwritten by the next inbound PlayerInputPacket from
+            // any peer.  By the time ProcessTick runs, a stored reference would read stale data.
+            _latestInputByPeer[peer] = new PlayerInputData
+            {
+                TickNumber = packet.TickNumber,
+                InputX     = packet.InputX,
+                InputY     = packet.InputY,
+            };
         }
 
         public void EnqueueAttack(NetPeer peer, AttackRequestPacket packet)
@@ -430,12 +531,24 @@ namespace GameServer
 
         private void RunGameLoop()
         {
-            var sw = new Stopwatch();
+            // ── Drift-free absolute-deadline heartbeat ────────────────────────────────
+            // Rather than sleeping (MsPerTick - elapsed), we track the absolute Stopwatch
+            // timestamp at which each tick SHOULD fire.  If a tick runs long, the next
+            // deadline is still computed from the original baseline, so overruns self-correct
+            // instead of compounding.  SpinWait is used for the final sub-millisecond window
+            // to avoid the 15.6 ms OS timer-resolution floor of Thread.Sleep.
+            //
+            // NOTE: Use integer division (Frequency / TickRate) rather than
+            //   (long)(Stopwatch.Frequency * DeltaTime) where DeltaTime is float.
+            //   1f/30f is not exactly representable in IEEE 754 single precision;
+            //   the float path introduces a consistent per-tick rounding bias that
+            //   compounds into measurable phase drift over millions of ticks.
+            //   Integer division is exact (same truncation, zero bias).
+            long ticksPerTick = Stopwatch.Frequency / TickRate;
+            long nextTickTime  = Stopwatch.GetTimestamp();
 
             while (_isRunning)
             {
-                sw.Restart();
-
                 _network!.PollEvents();
                 ProcessTick();
                 BroadcastState();
@@ -455,8 +568,25 @@ namespace GameServer
 
                 _tick++;
 
-                int sleep = MsPerTick - (int)sw.ElapsedMilliseconds;
-                if (sleep > 0) Thread.Sleep(sleep);
+                // Advance deadline by exactly one tick interval, regardless of how long this
+                // tick took.  This keeps the heartbeat phase-locked to the original start time.
+                nextTickTime += ticksPerTick;
+
+                long remaining = nextTickTime - Stopwatch.GetTimestamp();
+                if (remaining > 0)
+                {
+                    // Convert to milliseconds for the coarse Sleep, keeping 1 ms in reserve
+                    // for the SpinWait to fill the sub-millisecond gap without over-sleeping.
+                    long sleepMs = (remaining * 1000L / Stopwatch.Frequency) - 1;
+                    if (sleepMs > 0)
+                        Thread.Sleep((int)sleepMs);
+
+                    // Spin the final sub-millisecond window with zero OS scheduler involvement.
+                    while (Stopwatch.GetTimestamp() < nextTickTime)
+                        Thread.SpinWait(8);
+                }
+                // If remaining <= 0 the tick ran over-budget; no sleep, fire next tick immediately.
+                // The deadline still advances by ticksPerTick, so the loop self-corrects.
             }
         }
 
@@ -465,18 +595,29 @@ namespace GameServer
             // Tick order is intentionally fixed. Reordering phases can change gameplay semantics
             // (for example, movement-before-combat range checks and projectile-before-DoT timing).
 
-            // ── 1. Movement ───────────────────────────────────────────────────
-            foreach (KeyValuePair<NetPeer, PlayerInputPacket> entry in _latestInputByPeer)
-            {
-                if (!_latestInputByPeer.TryRemove(entry.Key, out PlayerInputPacket? latestInput))
-                    continue;
+            // ── 0. Deferred profile hydration ────────────────────────────────────────
+            // Drain completed background Redis reads.  Zero blocking — we only process
+            // tasks that are already finished.  Pending tasks are left in the queue.
+            FinalizeHydration();
 
+            // ── 1. Movement ───────────────────────────────────────────────────
+            // _latestInputByPeer is a plain Dictionary — foreach uses its struct enumerator,
+            // which is a value type and does NOT allocate on the heap.  Each value is a
+            // PlayerInputData struct copy, independent of the LiteNetLib reusable packet object.
+            foreach (KeyValuePair<NetPeer, PlayerInputData> entry in _latestInputByPeer)
+            {
                 if (_peerMap.TryGetValue(entry.Key, out PlayerSession? player))
-                    MovementSystem.ProcessInput(player, latestInput, DeltaTime, _zone.Bounds);
+                    MovementSystem.ProcessInput(player, entry.Value, DeltaTime, _zone.Bounds);
             }
+            _latestInputByPeer.Clear();
             // Snapshot authoritative positions after movement for lag-compensation rewind.
             for (int i = 0; i < _players.Count; i++)
                 _players[i].RecordPositionHistory(_tick);
+
+            // Rebuild spatial grid once per tick after movement resolves.
+            // _spatialGrid is guaranteed non-null here — initialised eagerly in Start() before
+            // the game loop begins, so the null check that used to appear here is gone.
+            _spatialGrid!.RebuildEachTick(_players);
             // ── 2. Melee auto-attacks ─────────────────────────────────────────
             while (_attackQueue.TryDequeue(out var entry))
             {
@@ -489,7 +630,7 @@ namespace GameServer
                 _reusableStatusEffects.Clear();
                 CombatEventPacket? ev = CombatSystem.ProcessMeleeAttack(
                     attacker, target, _tick, entry.Packet.TickNumber, _reusableStatusEffects);
-                if (ev != null) BroadcastCombatEvent(ev);
+                if (ev.HasValue) BroadcastCombatEvent(ev.Value);
                 BroadcastStatusEffects(_reusableStatusEffects);
             }
 
@@ -526,39 +667,51 @@ namespace GameServer
                 if (!shooter.IsAlive) continue;
                 if (shooter.IsOnCooldown(spell.SpellId, _tick, spell.CooldownTicks)) continue;
 
-                ProjectileState? proj = ProjectileSystem.SpawnProjectile(
-                    shooter, entry.Packet, spell, _nextProjectileId++);
+                // Guard: silently drop the shot if the projectile pool is full rather than
+                // growing unbounded.  At 512 slots this is a hard ceiling, not a normal path.
+                if (_projectileCount >= MaxProjectiles) continue;
 
-                if (proj == null) continue;
+                // TrySpawnProjectile writes the new struct directly into the out parameter —
+                // zero heap allocation (struct return, stored in the fixed array below).
+                if (!ProjectileSystem.TrySpawnProjectile(
+                        shooter, entry.Packet, spell, _nextProjectileId, out ProjectileState newProj))
+                    continue;
 
-                _projectiles.Add(proj);
+                _projectiles[_projectileCount++] = newProj;
+                _nextProjectileId++;
                 shooter.SetCooldown(spell.SpellId, _tick);
 
-                _network?.SendToInterested(new ProjectileSpawnPacket
-                {
-                    ProjectileId = proj.ProjectileId,
-                    OwnerId      = proj.OwnerId,
-                    SpellId      = proj.SpellId,
-                    StartX       = proj.Position.X,
-                    StartY       = proj.Position.Y,
-                    DirectionX   = proj.DirectionX,
-                    DirectionY   = proj.DirectionY,
-                    Speed        = proj.Speed,
-                    MaxRange     = proj.MaxRange,
-                }, DeliveryMethod.ReliableOrdered, proj.Position, _zone.EventFilter, _players);
+                // Mutate the pre-allocated broadcast struct — zero heap allocation.
+                // Direction and speed are compressed to halve wire size vs raw floats.
+                _projSpawnPacket.ProjectileId = newProj.ProjectileId;
+                _projSpawnPacket.OwnerId      = newProj.OwnerId;
+                _projSpawnPacket.SpellId      = newProj.SpellId;
+                _projSpawnPacket.StartX       = PacketEncoding.EncodePosition(newProj.Position.X);
+                _projSpawnPacket.StartY       = PacketEncoding.EncodePosition(newProj.Position.Y);
+                _projSpawnPacket.DirectionX   = PacketEncoding.EncodeDirection(newProj.DirectionX);
+                _projSpawnPacket.DirectionY   = PacketEncoding.EncodeDirection(newProj.DirectionY);
+                _projSpawnPacket.Speed        = PacketEncoding.EncodeSpeed(newProj.Speed);
+                _projSpawnPacket.MaxRange     = PacketEncoding.EncodeSpeed(newProj.MaxRange);
+                // Pass the spatial grid so only nearby clients receive the spawn packet.
+                _network?.SendToInterested(in _projSpawnPacket, DeliveryMethod.ReliableOrdered,
+                    newProj.Position, _zone.EventFilter, _players, _spatialGrid);
             }
 
             // ── 5. Tick active projectiles (move + collision) ─────────────────────
-            if (_projectiles.Count > 0)
+            if (_projectileCount > 0)
             {
+                // Pass the spatial grid so ProjectileSystem narrows collision candidates
+                // from O(N-all-players) to O(k-nearby) for each projectile — critical at
+                // MMORPG scale where N can be 2 000 and projectile counts reach hundreds.
                 ProjectileSystem.TickResult result =
-                    ProjectileSystem.Tick(_projectiles, _players, DeltaTime);
+                    ProjectileSystem.Tick(_projectiles, ref _projectileCount, _players, _entityMap, DeltaTime, _spatialGrid);
 
-                // Pierce hits — damage lands but projectile keeps flying (no destroy packet)
+                // Pierce hits — damage lands but projectile keeps flying (no destroy packet).
+                // Index-based for loops avoid List<T>.Enumerator overhead on the hot path.
                 if (result.PierceHits != null)
                 {
-                    foreach (CombatEventPacket ev in result.PierceHits)
-                        BroadcastCombatEvent(ev);
+                    for (int pi = 0; pi < result.PierceHits.Count; pi++)
+                        BroadcastCombatEvent(result.PierceHits[pi]);
                 }
 
                 if (result.StatusEffects != null)
@@ -567,34 +720,33 @@ namespace GameServer
                 // Splash hits from explosive detonations — extra targets hit by AoE on impact
                 if (result.SplashHits != null)
                 {
-                    foreach (CombatEventPacket ev in result.SplashHits)
-                        BroadcastCombatEvent(ev);
+                    for (int pi = 0; pi < result.SplashHits.Count; pi++)
+                        BroadcastCombatEvent(result.SplashHits[pi]);
                 }
 
                 // Final hits — projectile consumed after landing
                 if (result.Hits != null)
                 {
-                    foreach (var (projId, ev) in result.Hits)
+                    for (int pi = 0; pi < result.Hits.Count; pi++)
                     {
+                        (int projId, CombatEventPacket ev) = result.Hits[pi];
                         BroadcastCombatEvent(ev);
                         Vec2 hitOrigin = FindById(ev.TargetId)?.Position ?? Vec2.Zero;
-                        _network?.SendToInterested(new ProjectileDestroyPacket
-                        {
-                            ProjectileId = projId,
-                            HitSomething = true,
-                        }, DeliveryMethod.ReliableOrdered, hitOrigin, _zone.EventFilter, _players);
+                        // Mutate pre-allocated struct — zero heap allocation.
+                        _projDestPacket.ProjectileId = projId;
+                        _projDestPacket.HitSomething = true;
+                        _network?.SendToInterested(in _projDestPacket, DeliveryMethod.ReliableOrdered, hitOrigin, _zone.EventFilter, _players, _spatialGrid);
                     }
                 }
 
                 if (result.ExpiredIds != null)
                 {
-                    foreach (int projId in result.ExpiredIds)
+                    for (int pi = 0; pi < result.ExpiredIds.Count; pi++)
                     {
-                        _network?.SendToAll(new ProjectileDestroyPacket
-                        {
-                            ProjectileId = projId,
-                            HitSomething = false,
-                        }, DeliveryMethod.ReliableOrdered);
+                        // Mutate pre-allocated struct — zero heap allocation.
+                        _projDestPacket.ProjectileId = result.ExpiredIds[pi];
+                        _projDestPacket.HitSomething = false;
+                        _network?.SendToAll(in _projDestPacket, DeliveryMethod.ReliableOrdered);
                     }
                 }
             }
@@ -609,20 +761,16 @@ namespace GameServer
                     _network?.SendTo(_players[i].Peer!, _players[i].BuildStatsPacket(), DeliveryMethod.ReliableOrdered);
             }
 
-            if (_statusTickEvents.Count > 0)
+            // Broadcast DoT damage events accumulated during TickStatusEffects.
+            for (int i = 0; i < _statusTickEvents.Count; i++)
+                BroadcastCombatEvent(_statusTickEvents[i]);
+
+            // Broadcast status-effect expiry notifications.
+            for (int i = 0; i < _expiredStatusEffects.Count; i++)
             {
-                for (int i = 0; i < _statusTickEvents.Count; i++)
-                    BroadcastCombatEvent(_statusTickEvents[i]);
-
-                _statusTickEvents.Clear();
-            }
-
-            if (_expiredStatusEffects.Count > 0)
-            {
-                for (int i = 0; i < _expiredStatusEffects.Count; i++)
-                    BroadcastStatusEffectRemoval(_expiredStatusEffects[i]);
-
-                _expiredStatusEffects.Clear();
+                // Local copy is stack-allocated (struct); `in` avoids a second copy on the call.
+                StatusEffectRemovedPacket expired = _expiredStatusEffects[i];
+                BroadcastStatusEffectRemoval(in expired);
             }
 
             // ── Phase 8: Death detection ──────────────────────────────────────────
@@ -641,11 +789,10 @@ namespace GameServer
                     }
 
                     Vec2 deathPos = p.Position;
-                    _network?.SendToInterested(new PlayerDeathPacket
-                    {
-                        KilledEntityId = p.EntityId,
-                        KillerEntityId = p.LastKillerEntityId,
-                    }, DeliveryMethod.ReliableOrdered, deathPos, _zone.EventFilter, _players);
+                    // Mutate pre-allocated struct — zero heap allocation, zero copy (in-ref).
+                    _deathPacket.KilledEntityId = p.EntityId;
+                    _deathPacket.KillerEntityId = p.LastKillerEntityId;
+                    _network?.SendToInterested(in _deathPacket, DeliveryMethod.ReliableOrdered, deathPos, _zone.EventFilter, _players, _spatialGrid);
                 }
             }
 
@@ -656,13 +803,12 @@ namespace GameServer
                 Vec2 spawnPoint = _zone.GetSpawnPoint(p.Faction);
                 if (p.TickRespawn(spawnPoint))
                 {
-                    _network?.SendToInterested(new PlayerRespawnPacket
-                    {
-                        EntityId = p.EntityId,
-                        X        = p.Position.X,
-                        Y        = p.Position.Y,
-                        Health   = p.Health,
-                    }, DeliveryMethod.ReliableOrdered, spawnPoint, _zone.EventFilter, _players);
+                    // Mutate pre-allocated struct — zero heap allocation, zero copy (in-ref).
+                    _respawnPacket.EntityId = p.EntityId;
+                    _respawnPacket.X        = PacketEncoding.EncodePosition(p.Position.X);
+                    _respawnPacket.Y        = PacketEncoding.EncodePosition(p.Position.Y);
+                    _respawnPacket.Health   = PacketEncoding.EncodeHealth(p.Health);
+                    _network?.SendToInterested(in _respawnPacket, DeliveryMethod.ReliableOrdered, spawnPoint, _zone.EventFilter, _players, _spatialGrid);
                 }
             }
 
@@ -688,27 +834,28 @@ namespace GameServer
             }
 
             // --- Part B: preset gear-set quickswaps (latest-wins) ---
+            // Plain Dictionary foreach uses a struct enumerator — zero allocation.
             foreach (KeyValuePair<NetPeer, GearSetSwapRequestPacket> entry in _latestGearSwapByPeer)
             {
-                if (!_latestGearSwapByPeer.TryRemove(entry.Key, out GearSetSwapRequestPacket? swapReq))
-                    continue;
-
                 if (!_peerMap.TryGetValue(entry.Key, out PlayerSession? swapSession))
                     continue;
 
-                if (swapSession.TryApplyGearSet(swapReq.SetIndex, out PlayerStatsRefreshedPacket refreshPkt))
+                if (swapSession.TryApplyGearSet(entry.Value.SetIndex, out PlayerStatsRefreshedPacket refreshPkt))
                 {
                     if (swapSession.Peer != null)
                         _network?.SendTo(swapSession.Peer, refreshPkt, DeliveryMethod.ReliableOrdered);
-                    Console.WriteLine($"[Arena] {swapSession.PlayerName} swapped to gear set {swapReq.SetIndex}");
+                    // NOTE: Console.WriteLine with string interpolation allocates — omit from hot path.
+                    // Uncomment only during debug builds:
+                    // Console.WriteLine($"[Arena] {swapSession.PlayerName} swapped to gear set {entry.Value.SetIndex}");
                 }
             }
+            _latestGearSwapByPeer.Clear();
 
             // ── Phase 9c: Ground item pickups ─────────────────────────────────────
             while (_pickupQueue.TryDequeue(out (NetPeer Peer, GroundItemPickupRequestPacket Packet) pickup))
             {
                 if (!_peerMap.TryGetValue(pickup.Peer, out PlayerSession? picker)) continue;
-                if (!_groundItems.TryGetValue(pickup.Packet.GroundItemId, out GroundItem? groundItem)) continue;
+                if (!_groundItems.TryGetValue(pickup.Packet.GroundItemId, out GroundItem groundItem)) continue;
 
                 // Server-side distance check: player must be within 2 units of the ground item.
                 if (CombatMath.DistanceSqr(picker.Position, groundItem.Position) > 4f) continue;
@@ -718,19 +865,18 @@ namespace GameServer
 
                 _groundItems.Remove(pickup.Packet.GroundItemId);
 
+                // Mutate pre-allocated structs — zero heap allocation, zero copy (in-ref).
                 // Tell everyone nearby the item is gone.
-                _network?.SendToInterested(new GroundItemRemovedPacket
-                {
-                    GroundItemId = groundItem.GroundItemId,
-                }, DeliveryMethod.ReliableOrdered, groundItem.Position, _zone.EventFilter, _players);
+                _groundRemovedPacket.GroundItemId = groundItem.GroundItemId;
+                _network?.SendToInterested(in _groundRemovedPacket, DeliveryMethod.ReliableOrdered, groundItem.Position, _zone.EventFilter, _players, _spatialGrid);
 
                 // Confirm to the picking player that the item was added to their inventory.
                 if (picker.Peer != null)
-                    _network?.SendTo(picker.Peer, new ItemAddedToInventoryPacket
-                    {
-                        DefinitionId = groundItem.Item.DefinitionId,
-                        InstanceId   = groundItem.Item.InstanceId,
-                    }, DeliveryMethod.ReliableOrdered);
+                {
+                    _itemAddedPacket.DefinitionId = groundItem.Item.DefinitionId;
+                    _itemAddedPacket.InstanceId   = groundItem.Item.InstanceId;
+                    _network?.SendTo(picker.Peer, in _itemAddedPacket, DeliveryMethod.ReliableOrdered);
+                }
             }
 
             // ── Phase 10: Win-condition check ─────────────────────────────────────
@@ -744,55 +890,108 @@ namespace GameServer
         {
             if (_network == null) return;
 
+            // ── Pre-encode tick fields once for the entire broadcast pass ─────────────
+            // EncodeTick24 is called here rather than inside the inner loop so the same
+            // three bytes are reused across all position packets this tick.
+            PacketEncoding.EncodeTick24(_tick, out ushort serverTickLo, out byte serverTickHi);
+
             for (int viewerIndex = 0; viewerIndex < _players.Count; viewerIndex++)
             {
                 PlayerSession viewer = _players[viewerIndex];
-                // Skip ghost sessions whose peer was cleared on disconnect.
-                // They have no live socket to receive state updates.
                 if (viewer.Peer == null) continue;
 
-                for (int entityIndex = 0; entityIndex < _players.Count; entityIndex++)
-                {
-                    PlayerSession entity = _players[entityIndex];
+                // Query the spatial grid for the 3×3 cell neighbourhood around this viewer.
+                // _spatialGrid is guaranteed non-null here (initialised in Start, rebuilt each tick).
+                // For a 2 000-player zone this reduces the inner loop from O(N) to O(k)
+                // where k = players in adjacent cells, typically single digits to low hundreds.
+                // In Arena mode (10-20 players, small map) all players fit in a few cells —
+                // the overhead of the grid is negligible and the code path is identical.
+                System.Collections.Generic.List<PlayerSession> nearby =
+                    _spatialGrid!.QueryNeighbours(viewer.Position);
 
-                    if (entity.EntityId != viewer.EntityId &&
+                for (int ni = 0; ni < nearby.Count; ni++)
+                {
+                    PlayerSession entity = nearby[ni];
+                    bool isSelf = entity.EntityId == viewer.EntityId;
+
+                    if (!isSelf &&
                         CombatMath.DistanceSqr(viewer.Position, entity.Position) > _viewRadiusSqr)
                         continue;
 
-                    _network.SendTo(viewer.Peer, new EntityPositionPacket
-                    {
-                        EntityId         = entity.EntityId,
-                        X                = entity.Position.X,
-                        Y                = entity.Position.Y,
-                        ServerTick       = _tick,
-                        AcknowledgedTick = entity.LastProcessedClientTick,
-                    }, DeliveryMethod.Unreliable);
+                    // ── Delta-compression position check ─────────────────────────────
+                    // Encode position once; compare against the value broadcast last tick.
+                    // LastBroadcastX/Y are updated in CommitBroadcastState() AFTER all
+                    // viewers are processed, so every viewer in the same tick sees the
+                    // same "changed" / "unchanged" decision for a given entity.
+                    //
+                    // Own entity: always send regardless of movement — the client needs
+                    // the AcknowledgedTick field for input reconciliation every tick.
+                    // Other entities: skip if position encoding hasn't changed.
+                    short encX = PacketEncoding.EncodePosition(entity.Position.X);
+                    short encY = PacketEncoding.EncodePosition(entity.Position.Y);
 
+                    if (isSelf || encX != entity.LastBroadcastX || encY != entity.LastBroadcastY)
+                    {
+                        // Mutate pre-allocated struct — zero heap allocation.
+                        // Ticks use 24-bit wrapping encoding: 3 bytes each instead of 4.
+                        _posPacket.EntityId = entity.EntityId;
+                        _posPacket.X        = encX;
+                        _posPacket.Y        = encY;
+                        _posPacket.ServerTickLo      = serverTickLo;
+                        _posPacket.ServerTickHi      = serverTickHi;
+                        PacketEncoding.EncodeTick24(entity.LastProcessedClientTick,
+                            out _posPacket.AcknowledgedTickLo, out _posPacket.AcknowledgedTickHi);
+                        _network.SendTo(viewer.Peer, in _posPacket, DeliveryMethod.Unreliable);
+                    }
+
+                    // ── Delta-compression health check ────────────────────────────────
+                    // Health is faction-gated (allies only). Skip if HP encoding unchanged.
                     if (entity.Faction == viewer.Faction)
                     {
-                        _network.SendTo(viewer.Peer, new EntityHealthPacket
+                        ushort encHealth = PacketEncoding.EncodeHealth(entity.Health);
+                        if (encHealth != entity.LastBroadcastHealth)
                         {
-                            EntityId = entity.EntityId,
-                            Health   = entity.Health,
-                        }, DeliveryMethod.Unreliable);
+                            _healthPacket.EntityId = entity.EntityId;
+                            _healthPacket.Health   = encHealth;
+                            _network.SendTo(viewer.Peer, in _healthPacket, DeliveryMethod.Unreliable);
+                        }
                     }
                 }
+            }
+
+            // ── Commit broadcast state after ALL viewers have been served ─────────────
+            // Updating LastBroadcast* inside the inner loop would cause viewer[1] to see
+            // "unchanged" for an entity that viewer[0] just broadcast — incorrect.
+            // One O(N) pass here keeps the per-viewer logic clean and allocation-free.
+            CommitBroadcastState();
+        }
+
+        /// <summary>
+        /// Updates each player's delta-compression sentinels to reflect the encoded values
+        /// that were eligible for broadcast this tick.  Must be called exactly once per tick,
+        /// after BroadcastState() finishes iterating all viewers.
+        /// </summary>
+        private void CommitBroadcastState()
+        {
+            for (int i = 0; i < _players.Count; i++)
+            {
+                PlayerSession e = _players[i];
+                e.LastBroadcastX      = PacketEncoding.EncodePosition(e.Position.X);
+                e.LastBroadcastY      = PacketEncoding.EncodePosition(e.Position.Y);
+                e.LastBroadcastHealth = PacketEncoding.EncodeHealth(e.Health);
             }
         }
 
         private void BroadcastCombatEvent(CombatEventPacket ev)
         {
-            // Route through interest filter so only nearby players receive this event.
-            // In Arena mode EventFilter is BroadcastFilter (all players); in open-world zones
-            // it is a RadiusFilter so distant players are not spammed with irrelevant events.
             Vec2 origin = FindById(ev.TargetId)?.Position ?? Vec2.Zero;
-            _network?.SendToInterested(ev, DeliveryMethod.ReliableOrdered, origin, _zone.EventFilter, _players);
+            _network?.SendToInterested(in ev, DeliveryMethod.ReliableOrdered, origin, _zone.EventFilter, _players, _spatialGrid);
         }
 
         private void BroadcastAoEHitEvent(AoEHitEventPacket ev)
         {
             Vec2 origin = FindById(ev.HitEntityId)?.Position ?? Vec2.Zero;
-            _network?.SendToInterested(ev, DeliveryMethod.ReliableOrdered, origin, _zone.EventFilter, _players);
+            _network?.SendToInterested(in ev, DeliveryMethod.ReliableOrdered, origin, _zone.EventFilter, _players, _spatialGrid);
         }
 
         // ── Win Condition ─────────────────────────────────────────────────────
@@ -853,13 +1052,22 @@ namespace GameServer
             }
         }
 
-        private void BroadcastStatusEffects(IReadOnlyList<StatusEffectAppliedPacket> statusEffects)
+        // Accepts the concrete List<T> type rather than IReadOnlyList<T> so every
+        // .Count access and [i] indexer call is a direct array read (no vtable dispatch).
+        // All callers already hold List<StatusEffectAppliedPacket> references; the interface
+        // parameter provided zero abstraction benefit at measurable per-call cost in AoE combat.
+        private void BroadcastStatusEffects(List<StatusEffectAppliedPacket> statusEffects)
         {
             for (int i = 0; i < statusEffects.Count; i++)
-                BroadcastStatusEffect(statusEffects[i]);
+            {
+                // Copy to a local so we can pass by 'in' reference cleanly.
+                // The copy is stack-allocated (struct); no heap allocation occurs.
+                StatusEffectAppliedPacket p = statusEffects[i];
+                BroadcastStatusEffect(in p);
+            }
         }
 
-        private void BroadcastStatusEffect(StatusEffectAppliedPacket packet)
+        private void BroadcastStatusEffect(in StatusEffectAppliedPacket packet)
         {
             PlayerSession? target = FindById(packet.TargetEntityId);
             if (target == null || _network == null)
@@ -867,23 +1075,27 @@ namespace GameServer
 
             if (packet.Visibility == StatusEffectVisibility.Everyone)
             {
-                _network.SendToInterested(packet, DeliveryMethod.ReliableOrdered,
-                    target.Position, _zone.EventFilter, _players);
+                _network.SendToInterested(in packet, DeliveryMethod.ReliableOrdered,
+                    target.Position, _zone.EventFilter, _players, _spatialGrid);
                 return;
             }
 
-            for (int i = 0; i < _players.Count; i++)
+            // AlliesOnly: use the spatial grid neighbourhood to avoid iterating all N players.
+            // _spatialGrid is guaranteed non-null (initialised in Start, rebuilt each tick).
+            System.Collections.Generic.List<PlayerSession> nearby =
+                _spatialGrid!.QueryNeighbours(target.Position);
+            for (int i = 0; i < nearby.Count; i++)
             {
-                PlayerSession viewer = _players[i];
+                PlayerSession viewer = nearby[i];
                 // Skip ghost sessions and enemy players.
                 if (viewer.Peer == null) continue;
                 if (viewer.Faction != target.Faction) continue;
                 if (!_zone.EventFilter.ShouldReceive(viewer, target.Position)) continue;
-                _network.SendTo(viewer.Peer, packet, DeliveryMethod.ReliableOrdered);
+                _network.SendTo(viewer.Peer, in packet, DeliveryMethod.ReliableOrdered);
             }
         }
 
-        private void BroadcastStatusEffectRemoval(StatusEffectRemovedPacket packet)
+        private void BroadcastStatusEffectRemoval(in StatusEffectRemovedPacket packet)
         {
             PlayerSession? target = FindById(packet.TargetEntityId);
             if (target == null || _network == null)
@@ -891,18 +1103,22 @@ namespace GameServer
 
             if (packet.Visibility == StatusEffectVisibility.Everyone)
             {
-                _network.SendToInterested(packet, DeliveryMethod.ReliableOrdered,
-                    target.Position, _zone.EventFilter, _players);
+                _network.SendToInterested(in packet, DeliveryMethod.ReliableOrdered,
+                    target.Position, _zone.EventFilter, _players, _spatialGrid);
                 return;
             }
 
-            for (int i = 0; i < _players.Count; i++)
+            // AlliesOnly: spatial grid narrows the viewer set from O(N) to O(k).
+            // _spatialGrid is guaranteed non-null (initialised in Start, rebuilt each tick).
+            System.Collections.Generic.List<PlayerSession> nearby =
+                _spatialGrid!.QueryNeighbours(target.Position);
+            for (int i = 0; i < nearby.Count; i++)
             {
-                PlayerSession viewer = _players[i];
+                PlayerSession viewer = nearby[i];
                 if (viewer.Peer == null) continue;
                 if (viewer.Faction != target.Faction) continue;
                 if (!_zone.EventFilter.ShouldReceive(viewer, target.Position)) continue;
-                _network.SendTo(viewer.Peer, packet, DeliveryMethod.ReliableOrdered);
+                _network.SendTo(viewer.Peer, in packet, DeliveryMethod.ReliableOrdered);
             }
         }
 
@@ -914,8 +1130,42 @@ namespace GameServer
         // ── Heartbeat / grace-period maintenance ──────────────────────────────
 
         /// <summary>
-        /// Fire-and-forget: writes every active player's state to Redis so a crash loses at
-        /// most 60 s of progress.  Does not block the game loop; awaited on a thread-pool thread.
+        /// Drains the deferred-hydration queue, applying completed Redis profile reads to
+        /// their sessions.  Incomplete tasks are skipped and remain in the queue.
+        /// Called once per tick from ProcessTick — never blocks the tick thread.
+        /// </summary>
+        private void FinalizeHydration()
+        {
+            if (_pendingHydration.Count == 0) return;
+
+            // Drain the queue: dequeue everything, re-enqueue incomplete tasks, apply completed ones.
+            // All access is on the single game-loop thread — plain Queue<T>, no locks needed.
+            // Under normal conditions the queue has at most a handful of entries (one per
+            // connecting player), so this O(n) pass is negligible.
+            int count = _pendingHydration.Count;
+            for (int i = 0; i < count; i++)
+            {
+                var entry = _pendingHydration.Dequeue();
+
+                if (!entry.ProfileTask.IsCompleted)
+                {
+                    // Still waiting for Redis — put it back and try next tick.
+                    _pendingHydration.Enqueue(entry);
+                    continue;
+                }
+
+                DataLayer.PlayerProfile? profile = null;
+                if (!entry.ProfileTask.IsFaulted)
+                    profile = entry.ProfileTask.Result;
+
+                if (profile != null)
+                    entry.Session.HydrateFromProfile(profile);
+                else
+                    entry.Session.Health = entry.Session.MaxHealth;
+            }
+        }
+
+        /// <summary>  Does not block the game loop; awaited on a thread-pool thread.
         /// In Arena mode inventories are NOT included (pickups are match-scoped).
         /// In open-world zones inventories ARE included (items picked up must persist).
         /// </summary>
@@ -958,7 +1208,14 @@ namespace GameServer
                     EntityId = grace.Session.EntityId,
                 }, DeliveryMethod.ReliableOrdered);
 
-                Console.WriteLine($"[Arena] Grace period expired for {grace.Session.PlayerName} — entity despawned.");
+                // Task.Run with a capturing lambda allocates a closure object on the GC heap.
+                // ThreadPool.QueueUserWorkItem<TState> with a static lambda eliminates the closure:
+                // the player name is passed as the TState argument rather than being captured.
+                // 'static' forces a compile-time guarantee that the lambda captures nothing.
+                ThreadPool.QueueUserWorkItem(
+                    static name => Console.WriteLine($"[Arena] Grace period expired for {name} — entity despawned."),
+                    grace.Session.PlayerName,
+                    preferLocal: false);
             }
         }
 
@@ -967,6 +1224,12 @@ namespace GameServer
         /// Rewards are the only durable progression output from an Arena match (in-session pickups
         /// are discarded by design so Arena balance is not affected by loot variance).
         /// </summary>
+        // Pre-allocated single-element reward array — reused across all end-of-match reward
+        // computations. Avoids the 'new[]' heap allocation that would occur inside ProcessTick
+        // when EndMatch fires. Safe because EndMatch sets _isRunning = false before this is
+        // called, so no subsequent tick will observe a stale value.
+        private readonly CraftingIngredientReward[] _rewardScratch = new CraftingIngredientReward[1];
+
         private CraftingIngredientReward[] ComputeCraftingRewards(PlayerSession player, FactionId winner)
         {
             // Base participation reward: ingredient 1 (generic "arena shard"), quantity = 1.
@@ -974,7 +1237,10 @@ namespace GameServer
             // TODO: Replace with a configurable reward table once designer tooling is available.
             int total = 1 + player.KillCount + (player.Faction == winner ? 2 : 0);
             if (total <= 0) return System.Array.Empty<CraftingIngredientReward>();
-            return new[] { new CraftingIngredientReward { IngredientId = 1, Quantity = total } };
+
+            // Mutate the pre-allocated scratch slot instead of allocating 'new[]'.
+            _rewardScratch[0] = new CraftingIngredientReward { IngredientId = 1, Quantity = total };
+            return _rewardScratch;
         }
 
         // ── Ground item helpers ───────────────────────────────────────────────
@@ -987,21 +1253,26 @@ namespace GameServer
         {
             int id = _nextGroundItemId++;
             _groundItems[id] = new GroundItem { GroundItemId = id, Position = position, Item = item };
-            _network?.SendToInterested(new GroundItemSpawnedPacket
-            {
-                GroundItemId = id,
-                DefinitionId = item.DefinitionId,
-                X            = position.X,
-                Y            = position.Y,
-            }, DeliveryMethod.ReliableOrdered, position, _zone.EventFilter, _players);
+            // Mutate pre-allocated struct — zero heap allocation, passed by `in` to avoid copy.
+            _groundSpawnedPacket.GroundItemId = id;
+            _groundSpawnedPacket.DefinitionId = item.DefinitionId;
+            _groundSpawnedPacket.X            = PacketEncoding.EncodePosition(position.X);
+            _groundSpawnedPacket.Y            = PacketEncoding.EncodePosition(position.Y);
+            _network?.SendToInterested(in _groundSpawnedPacket, DeliveryMethod.ReliableOrdered, position, _zone.EventFilter, _players, _spatialGrid);
         }
 
-        /// <summary>Lightweight container for a lootable item that has landed on the ground.</summary>
-        private sealed class GroundItem
+        /// <summary>
+        /// Value-type container for a lootable item that has landed on the ground.
+        /// Stored directly in the Dictionary<int, GroundItem> value slots — no heap allocation
+        /// per drop event.  Item is a managed reference; making GroundItem a struct eliminates
+        /// the extra wrapper object while keeping the ItemInstance reference itself on the heap
+        /// (which is correct — ItemInstance has crafted-stat data that must outlive the drop).
+        /// </summary>
+        private struct GroundItem
         {
             public int          GroundItemId;
             public Vec2         Position;
-            public ItemInstance Item = null!;
+            public ItemInstance Item;
         }
     }
 }

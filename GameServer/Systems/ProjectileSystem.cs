@@ -66,45 +66,70 @@ namespace GameServer.Systems
             }
         }
 
+        // ── Scratch lists (pre-allocated, cleared before each Tick call) ─────
+        // The ??= new List<T>() pattern inside Tick allocates a new list on the first
+        // hit every tick, causing GC pressure proportional to combat activity.
+        // These static scratch lists are reused across every Tick invocation instead.
+        // ProjectileSystem is always called from the single game-loop thread, so
+        // no synchronisation is needed.
+        private static readonly List<(int, CombatEventPacket)>    s_hits         = new(8);
+        private static readonly List<CombatEventPacket>           s_pierceHits   = new(8);
+        private static readonly List<StatusEffectAppliedPacket>   s_statusEffects= new(8);
+        private static readonly List<CombatEventPacket>           s_splashHits   = new(8);
+        private static readonly List<int>                         s_expiredIds   = new(8);
+
         // ── Public API ────────────────────────────────────────────────────────
 
         /// <summary>
-        /// Validates the ShootRequestPacket and constructs a ProjectileState.
-        /// Returns null if the direction vector is degenerate (zero-vector exploit).
-        /// The caller is responsible for cooldown checks before calling this.
+        /// Validates the ShootRequestPacket and writes a new ProjectileState into
+        /// <paramref name="result"/> via an out parameter.
+        ///
+        /// Returns false if the direction vector is degenerate (zero-vector exploit) or any
+        /// spell/stats field is non-finite.  The caller is responsible for cooldown checks.
+        ///
+        /// Zero-allocation: ProjectileState is a struct; the out parameter is written directly
+        /// into the caller's pre-allocated array slot without any heap allocation.
         /// </summary>
-        public static ProjectileState? SpawnProjectile(
-            PlayerSession     shooter,
+        public static bool TrySpawnProjectile(
+            PlayerSession      shooter,
             ShootRequestPacket request,
             SpellDefinition    spell,
-            int                projectileId)
+            int                projectileId,
+            out ProjectileState result)
         {
+            result = default;
+
             if (!float.IsFinite(request.DirectionX) || !float.IsFinite(request.DirectionY))
-                return null;
+                return false;
 
             if (!float.IsFinite(spell.ProjectileSpeed) || spell.ProjectileSpeed <= 0f)
-                return null;
+                return false;
 
             if (!float.IsFinite(spell.ProjectileHitRadius) || spell.ProjectileHitRadius <= 0f)
-                return null;
+                return false;
 
             if (!float.IsFinite(spell.Range) || spell.Range <= 0f)
-                return null;
+                return false;
 
             // Re-normalise the client-supplied direction — never trust raw client values
             float mag = MathF.Sqrt(request.DirectionX * request.DirectionX +
                                    request.DirectionY * request.DirectionY);
             if (!float.IsFinite(mag) || mag < 0.001f)
-                return null;
+                return false;
 
             float maxRange = spell.Range * shooter.ProjectileRangeMultiplier;
             if (!float.IsFinite(maxRange) || maxRange <= 0f)
-                return null;
+                return false;
 
-            return new ProjectileState
+            // Write directly into the out parameter — the caller stores this in a pre-allocated
+            // array slot, so there is zero heap allocation for this entire spawn operation.
+            result = new ProjectileState
             {
                 ProjectileId      = projectileId,
                 OwnerId           = shooter.EntityId,
+                // Snapshot owner faction at spawn time so MatchesFactionFilter resolves in O(1)
+                // without scanning allPlayers on every collision check.
+                OwnerFaction      = shooter.Faction,
                 SpellId           = spell.SpellId,
                 Position          = shooter.Position,          // server-authoritative spawn point
                 DirectionX        = request.DirectionX / mag,
@@ -138,28 +163,48 @@ namespace GameServer.Systems
                 PierceChance      = spell.PierceChance,
                 TraveledDistance  = 0f,
             };
+            return true;
         }
 
         /// <summary>
         /// Advances every active projectile by one tick.
         /// Removes projectiles that collide with a player or exceed their MaxRange,
         /// and returns the corresponding events.
-        /// Iterates the list in reverse to allow safe in-place removal via RemoveAt.
+        ///
+        /// Zero-allocation design:
+        ///   • projectiles[] is a pre-allocated fixed array; projectileCount is passed by ref
+        ///     so this method can compact the array in-place without any List overhead.
+        ///   • ref ProjectileState proj = ref projectiles[i] gives a managed reference to the
+        ///     array element — mutations (position, pierce count) write directly to the array
+        ///     slot with no intermediate copy or heap activity.
+        ///   • Removal uses an O(1) forward-iteration swap-remove: the last live element is
+        ///     copied to the removed slot and projectileCount is decremented.  The loop index
+        ///     is NOT advanced after a removal so the newly moved element is processed next.
+        ///   • When grid != null, QueryNeighbours() narrows collision candidates from O(N) to
+        ///     O(k) — critical at MMORPG scale where N = 2 000 and projectile counts are high.
         /// </summary>
         public static TickResult Tick(
-            List<ProjectileState>        projectiles,
-            IReadOnlyList<PlayerSession> allPlayers,
-            float                        deltaTime)
+            ProjectileState[]            projectiles,
+            ref int                      projectileCount,
+            List<PlayerSession>          allPlayers,
+            System.Collections.Generic.IReadOnlyDictionary<int, PlayerSession> entityMap,
+            float                        deltaTime,
+            SpatialGrid?                 grid = null)
         {
-            List<(int, CombatEventPacket)>? hits       = null;
-            List<CombatEventPacket>?         pierceHits = null;
-            List<StatusEffectAppliedPacket>? statusEffects = null;
-            List<CombatEventPacket>?         splashHits = null;
-            List<int>?                       expiredIds = null;
+            // Clear scratch lists — no allocation, just resets the Count to 0.
+            s_hits.Clear();
+            s_pierceHits.Clear();
+            s_statusEffects.Clear();
+            s_splashHits.Clear();
+            s_expiredIds.Clear();
 
-            for (int i = projectiles.Count - 1; i >= 0; i--)
+            // Forward-iteration with manual index management.
+            // On removal: swap-remove the slot (copy last element to [i]) and do NOT
+            // advance i — the loop will re-examine the moved element on the next iteration.
+            for (int i = 0; i < projectileCount; /* advanced below */)
             {
-                ProjectileState proj = projectiles[i];
+                ref ProjectileState proj = ref projectiles[i];
+
                 if (!float.IsFinite(proj.Position.X)
                     || !float.IsFinite(proj.Position.Y)
                     || !float.IsFinite(proj.DirectionX)
@@ -168,20 +213,20 @@ namespace GameServer.Systems
                     || !float.IsFinite(proj.TraveledDistance)
                     || !float.IsFinite(proj.MaxRange))
                 {
-                    expiredIds ??= new List<int>();
-                    expiredIds.Add(proj.ProjectileId);
-                    projectiles.RemoveAt(i);
+                    s_expiredIds.Add(proj.ProjectileId);
+                    SwapRemove(projectiles, ref projectileCount, i);
+                    // Do NOT increment i — the swapped-in element must be examined next.
                     continue;
                 }
 
                 // ── Move ──────────────────────────────────────────────────────
-                // Direction is normalised, so distance = Speed × deltaTime exactly
+                // Direction is normalised, so distance = Speed × deltaTime exactly.
+                // Writing through the ref mutates the array element in-place — zero copy.
                 float step = proj.Speed * deltaTime;
                 if (!float.IsFinite(step) || step <= 0f)
                 {
-                    expiredIds ??= new List<int>();
-                    expiredIds.Add(proj.ProjectileId);
-                    projectiles.RemoveAt(i);
+                    s_expiredIds.Add(proj.ProjectileId);
+                    SwapRemove(projectiles, ref projectileCount, i);
                     continue;
                 }
 
@@ -191,15 +236,23 @@ namespace GameServer.Systems
                 proj.TraveledDistance += step;
 
                 // ── Collision ─────────────────────────────────────────────────
+                // Narrow the candidate set with the spatial grid when available.
+                // grid.QueryNeighbours() returns a pre-allocated scratch List —
+                // safe to use here because we consume it fully before the next
+                // QueryNeighbours call (which would overwrite the same buffer).
+                IReadOnlyList<PlayerSession> candidates =
+                    grid != null ? grid.QueryNeighbours(proj.Position) : allPlayers;
+
                 bool hitSomeone = false;
 
-                for (int j = 0; j < allPlayers.Count; j++)
+                for (int j = 0; j < candidates.Count; j++)
                 {
-                    PlayerSession target = allPlayers[j];
+                    PlayerSession target = candidates[j];
                     if (!target.IsAlive || target.EntityId == proj.OwnerId)
                         continue;
 
-                    if (!MatchesFactionFilter(proj.TargetFactionFilter, allPlayers, proj.OwnerId, target))
+                    // O(1) faction check — OwnerFaction was snapshotted at spawn time.
+                    if (!MatchesFactionFilter(proj.TargetFactionFilter, proj.OwnerFaction, target))
                         continue;
 
                     if (!CombatMath.IsInAoE(proj.Position, proj.HitRadius, target.Position))
@@ -225,16 +278,17 @@ namespace GameServer.Systems
                         if (isCrit) damage *= 2;
 
                         target.ApplyDamage(damage, proj.OwnerId);
-                        ApplyLifeSteal(proj, damage, allPlayers);
-                        ApplyProjectileStatusEffect(proj, target, ref statusEffects);
+                        ApplyLifeSteal(proj, damage, entityMap);
+                        ApplyProjectileStatusEffect(proj, target);
 
-                        var combatEv = new CombatEventPacket
+                        CombatEventPacket combatEv = new CombatEventPacket
                         {
-                            AttackerId = proj.OwnerId,
-                            TargetId   = target.EntityId,
-                            Damage     = damage,
-                            IsCritical = isCrit,
+                            PacketTypeId = PacketId.CombatEvent,
+                            AttackerId   = proj.OwnerId,
+                            TargetId     = target.EntityId,
+                            Damage       = DamageUtils.ClampAndEncode(damage, proj.OwnerId, "projectile"),
                         };
+                        combatEv.IsCritical = isCrit;
 
                         if (proj.PierceCount > 0)
                         {
@@ -242,20 +296,23 @@ namespace GameServer.Systems
                             // Consume one charge, broadcast damage without destroy packet.
                             // Do NOT break — continue checking remaining targets this tick.
                             proj.PierceCount--;
-                            pierceHits ??= new List<CombatEventPacket>();
-                            pierceHits.Add(combatEv);
+                            s_pierceHits.Add(combatEv);
                         }
                         else
                         {
                             // ── FINAL HIT — all pierce charges used ─────────────────────
-                            hits ??= new List<(int, CombatEventPacket)>();
-                            hits.Add((proj.ProjectileId, combatEv));
+                            // Capture ProjectileId BEFORE SwapRemove — after the swap, proj
+                            // (ref to projectiles[i]) points to the moved element, not this one.
+                            int projId = proj.ProjectileId;
+                            s_hits.Add((projId, combatEv));
 
-                            // Explosive detonation: splash all other players in AoE radius
+                            // Explosive detonation: splash all other players in AoE radius.
+                            // Pass allPlayers (not grid-narrowed candidates) to ensure full AoE
+                            // coverage beyond the per-projectile collision query window.
                             if (proj.AoERadius > 0f)
-                                ApplyExplosiveSplash(proj, target, allPlayers, ref splashHits, ref statusEffects);
+                                ApplyExplosiveSplash(proj, target, allPlayers, entityMap);
 
-                            projectiles.RemoveAt(i);
+                            SwapRemove(projectiles, ref projectileCount, i);
                             hitSomeone = true;
                             break;
                         }
@@ -265,9 +322,8 @@ namespace GameServer.Systems
                         // ── NEAR MISS ─────────────────────────────────────────────────
                         // Geometric overlap but deflected at distance. Near-misses always
                         // consume the projectile regardless of remaining pierce charges.
-                        expiredIds ??= new List<int>();
-                        expiredIds.Add(proj.ProjectileId);
-                        projectiles.RemoveAt(i);
+                        s_expiredIds.Add(proj.ProjectileId);
+                        SwapRemove(projectiles, ref projectileCount, i);
                         hitSomeone = true;
                         break;
                     }
@@ -276,13 +332,37 @@ namespace GameServer.Systems
                 // ── Range Expiry ──────────────────────────────────────────────
                 if (!hitSomeone && proj.TraveledDistance >= proj.MaxRange)
                 {
-                    expiredIds ??= new List<int>();
-                    expiredIds.Add(proj.ProjectileId);
-                    projectiles.RemoveAt(i);
+                    s_expiredIds.Add(proj.ProjectileId);
+                    SwapRemove(projectiles, ref projectileCount, i);
+                    // Do NOT increment i.
+                    continue;
                 }
+
+                if (!hitSomeone)
+                    i++; // Only advance when the slot was not replaced by a swap-remove.
             }
 
-            return new TickResult(hits, pierceHits, statusEffects, splashHits, expiredIds);
+            // Return references to scratch lists — callers must not hold references across ticks.
+            return new TickResult(
+                s_hits.Count         > 0 ? s_hits         : null,
+                s_pierceHits.Count   > 0 ? s_pierceHits   : null,
+                s_statusEffects.Count> 0 ? s_statusEffects: null,
+                s_splashHits.Count   > 0 ? s_splashHits   : null,
+                s_expiredIds.Count   > 0 ? s_expiredIds   : null);
+        }
+
+        /// <summary>
+        /// O(1) in-place removal: copies the last live element into slot <paramref name="index"/>
+        /// and decrements the count.  The moved element will be re-examined by the caller
+        /// on the next loop iteration (caller must NOT advance the index after calling this).
+        /// </summary>
+        [System.Runtime.CompilerServices.MethodImpl(
+            System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        private static void SwapRemove(ProjectileState[] array, ref int count, int index)
+        {
+            count--;
+            if (index < count)
+                array[index] = array[count];
         }
 
         // ── Private Helpers ───────────────────────────────────────────────────
@@ -295,9 +375,8 @@ namespace GameServer.Systems
         private static void ApplyExplosiveSplash(
             ProjectileState              proj,
             PlayerSession                primaryTarget,
-            IReadOnlyList<PlayerSession> allPlayers,
-            ref List<CombatEventPacket>? splashHits,
-            ref List<StatusEffectAppliedPacket>? statusEffects)
+            List<PlayerSession>          allPlayers,
+            System.Collections.Generic.IReadOnlyDictionary<int, PlayerSession> entityMap)
         {
             for (int k = 0; k < allPlayers.Count; k++)
             {
@@ -312,7 +391,7 @@ namespace GameServer.Systems
                 if (!CombatMath.IsInAoE(proj.Position, proj.AoERadius, splash.Position))
                     continue;
 
-                if (!MatchesFactionFilter(proj.TargetFactionFilter, allPlayers, proj.OwnerId, splash))
+                if (!MatchesFactionFilter(proj.TargetFactionFilter, proj.OwnerFaction, splash))
                     continue;
 
                 float splashAbsorb = proj.DamageType == DamageType.Magic
@@ -326,24 +405,24 @@ namespace GameServer.Systems
                 if (splashCrit) splashDmg *= 2;
 
                 splash.ApplyDamage(splashDmg, proj.OwnerId);
-                ApplyLifeSteal(proj, splashDmg, allPlayers);
-                ApplyProjectileStatusEffect(proj, splash, ref statusEffects);
+                ApplyLifeSteal(proj, splashDmg, entityMap);
+                ApplyProjectileStatusEffect(proj, splash);
 
-                splashHits ??= new List<CombatEventPacket>();
-                splashHits.Add(new CombatEventPacket
+                CombatEventPacket splashEv = new CombatEventPacket
                 {
-                    AttackerId = proj.OwnerId,
-                    TargetId   = splash.EntityId,
-                    Damage     = splashDmg,
-                    IsCritical = splashCrit,
-                });
+                    PacketTypeId = PacketId.CombatEvent,
+                    AttackerId   = proj.OwnerId,
+                    TargetId     = splash.EntityId,
+                    Damage       = DamageUtils.ClampAndEncode(splashDmg, proj.OwnerId, "splash"),
+                };
+                splashEv.IsCritical = splashCrit;
+                s_splashHits.Add(splashEv);
             }
         }
 
         private static void ApplyProjectileStatusEffect(
             ProjectileState proj,
-            PlayerSession target,
-            ref List<StatusEffectAppliedPacket>? statusEffects)
+            PlayerSession target)
         {
             if (proj.StatusEffectId <= 0)
                 return;
@@ -368,55 +447,43 @@ namespace GameServer.Systems
                 return;
             }
 
-            statusEffects ??= new List<StatusEffectAppliedPacket>();
-            statusEffects.Add(packet);
+            s_statusEffects.Add(packet);
         }
 
+        // O(1) life-steal heal — resolves shooter by entity-map lookup instead of O(N) linear scan.
+        // At 2 000 players with 100 active projectiles hitting per tick the old O(N) scan cost
+        // 200 000 iterations/tick just for life steal; the dictionary lookup is a single hash probe.
         private static void ApplyLifeSteal(
             ProjectileState proj,
             int damage,
-            IReadOnlyList<PlayerSession> allPlayers)
+            System.Collections.Generic.IReadOnlyDictionary<int, PlayerSession> entityMap)
         {
             if (damage <= 0 || proj.LifeStealPercent <= 0f)
                 return;
 
-            for (int i = 0; i < allPlayers.Count; i++)
-            {
-                if (allPlayers[i].EntityId != proj.OwnerId)
-                    continue;
-
-                float heal = damage * proj.LifeStealPercent;
-                if (heal > 0f)
-                    allPlayers[i].RestoreHealth(heal);
-
+            if (!entityMap.TryGetValue(proj.OwnerId, out PlayerSession? owner))
                 return;
-            }
+
+            float heal = damage * proj.LifeStealPercent;
+            if (heal > 0f)
+                owner.RestoreHealth(heal);
         }
 
+        /// <summary>
+        /// O(1) faction filter.  <paramref name="ownerFaction"/> is the shooter's faction
+        /// snapshotted into <see cref="ProjectileState.OwnerFaction"/> at spawn time,
+        /// eliminating the O(N) allPlayers scan that would otherwise be required.
+        /// </summary>
         private static bool MatchesFactionFilter(
             TargetFactionFilter filter,
-            IReadOnlyList<PlayerSession> allPlayers,
-            int ownerId,
-            PlayerSession target)
+            FactionId           ownerFaction,
+            PlayerSession       target)
         {
-            PlayerSession? owner = null;
-            for (int i = 0; i < allPlayers.Count; i++)
-            {
-                if (allPlayers[i].EntityId == ownerId)
-                {
-                    owner = allPlayers[i];
-                    break;
-                }
-            }
-
-            if (owner == null)
-                return false;
-
             return filter switch
             {
-                TargetFactionFilter.Any => true,
-                TargetFactionFilter.AlliesOnly => target.Faction == owner.Faction,
-                _ => target.Faction != owner.Faction,
+                TargetFactionFilter.Any        => true,
+                TargetFactionFilter.AlliesOnly => target.Faction == ownerFaction,
+                _                              => target.Faction != ownerFaction,
             };
         }
     }

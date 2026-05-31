@@ -71,7 +71,7 @@ namespace GameServer.Systems
             {
                 AttackerId = attacker.EntityId,
                 TargetId   = target.EntityId,
-                Damage     = damage,
+                Damage     = DamageUtils.ClampAndEncode(damage, attacker.EntityId, "melee"),
                 IsCritical = isCrit,
             };
         }
@@ -90,7 +90,7 @@ namespace GameServer.Systems
             PlayerSession                caster,
             SpellCastRequestPacket       request,
             SpellDefinition              spell,
-            IReadOnlyList<PlayerSession> allPlayers,
+            List<PlayerSession>          allPlayers,
             EntityMap                    entityMap,
             int                          currentTick,
             List<CombatEventPacket>      results,
@@ -164,7 +164,7 @@ namespace GameServer.Systems
             PlayerSession                caster,
             SpellCastRequestPacket       request,
             SpellDefinition              spell,
-            IReadOnlyList<PlayerSession> allPlayers,
+            List<PlayerSession>          allPlayers,
             List<AoEHitEventPacket>      aoeResults,
             List<StatusEffectAppliedPacket>? statusEffects)
         {
@@ -194,7 +194,7 @@ namespace GameServer.Systems
         private static void ProcessMeleeSplash(
             PlayerSession                caster,
             SpellDefinition              spell,
-            IReadOnlyList<PlayerSession> allPlayers,
+            List<PlayerSession>          allPlayers,
             List<AoEHitEventPacket>      aoeResults,
             List<StatusEffectAppliedPacket>? statusEffects)
         {
@@ -248,7 +248,7 @@ namespace GameServer.Systems
             {
                 AttackerId = attacker.EntityId,
                 TargetId   = target.EntityId,
-                Damage     = damage,
+                Damage     = DamageUtils.ClampAndEncode(damage, attacker.EntityId, "spell"),
                 IsCritical = isCrit,
             });
         }
@@ -292,12 +292,12 @@ namespace GameServer.Systems
                 CasterId    = attacker.EntityId,
                 SpellId     = spell.SpellId,
                 HitEntityId = target.EntityId,
-                Damage      = damage,
+                Damage      = DamageUtils.ClampAndEncode(damage, attacker.EntityId, "aoe"),
                 IsCritical  = isCrit,
             });
         }
 
-        private static PlayerSession? FindById(IReadOnlyList<PlayerSession> players, int entityId)
+        private static PlayerSession? FindById(List<PlayerSession> players, int entityId)
         {
             for (int i = 0; i < players.Count; i++)
                 if (players[i].EntityId == entityId) return players[i];

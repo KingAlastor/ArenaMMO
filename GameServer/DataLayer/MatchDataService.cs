@@ -154,9 +154,53 @@ namespace GameServer.DataLayer
             RedisValue raw = _redis.StringGet(ProfileKey(accountId));
             if (!raw.HasValue) return null;
 
+            // Use the byte[] implicit cast + Span<byte> overload to avoid materialising a
+            // managed string copy of the JSON payload. RedisValue.IsNull guards the cast.
+            byte[]? bytes = (byte[])raw;
+            if (bytes == null) return null;
+
             try
             {
-                return JsonSerializer.Deserialize<PlayerProfile>(raw.ToString());
+                return JsonSerializer.Deserialize<PlayerProfile>(bytes.AsSpan());
+            }
+            catch (JsonException ex)
+            {
+                Console.Error.WriteLine($"[DataService] Failed to deserialize profile for account {accountId}: {ex.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Reads the player profile from Redis asynchronously so the caller's thread
+        /// (the game-loop tick thread) is never blocked on network I/O.
+        ///
+        /// Uses the truly-async StringGetAsync overload so the StackExchange.Redis
+        /// connection multiplexer handles the Redis network round-trip on its own
+        /// internal I/O thread.  No ThreadPool thread is consumed during the wait —
+        /// this scales to hundreds of simultaneous zone entries without pool exhaustion.
+        ///
+        /// Usage in ArenaInstance.OnPlayerAuthenticated:
+        ///   1. Call this method immediately and store the returned Task on the session.
+        ///   2. Do NOT await inline — let the session enter the match with base/default stats.
+        ///   3. In ProcessTick's hydration phase, check Task.IsCompleted each tick.
+        ///      Once complete, call session.HydrateFromProfile(task.Result) and discard the task.
+        /// This ensures Redis latency (typically 0.5–10 ms) never eats into the 33ms tick budget.
+        /// </summary>
+        public async Task<PlayerProfile?> LoadPlayerProfileAsync(int accountId)
+        {
+            RedisValue raw = await _redis.StringGetAsync(ProfileKey(accountId)).ConfigureAwait(false);
+            if (!raw.HasValue) return null;
+
+            // Use the byte[] implicit cast + Span<byte> overload to avoid materialising a
+            // managed string copy of the JSON payload.  This path runs on a thread-pool
+            // continuation thread (after the await) so it never touches the tick thread,
+            // but eliminating the string copy reduces GC pressure at high connection rates.
+            byte[]? bytes = (byte[])raw;
+            if (bytes == null) return null;
+
+            try
+            {
+                return JsonSerializer.Deserialize<PlayerProfile>(bytes.AsSpan());
             }
             catch (JsonException ex)
             {

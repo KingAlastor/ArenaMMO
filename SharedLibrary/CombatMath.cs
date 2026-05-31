@@ -11,6 +11,15 @@ namespace SharedLibrary
         public const float DefaultMoveSpeed = 5.0f;
         public const float MeleeRange       = 1.5f;
 
+        // ── Damage cap ────────────────────────────────────────────────────────
+        // Design ceiling: no single hit should ever exceed 1,000 raw damage.
+        // 9,999 gives ~10× headroom above that ceiling before the clamp fires.
+        // Any value that reaches this constant indicates a bug in damage formula
+        // scaling (e.g. a runaway crit multiplier or stat overflow).  The server
+        // logs a warning via SecurityTelemetry when the cap is hit so it surfaces
+        // immediately in telemetry rather than silently wrapping to a ushort.
+        public const int MaxSingleHitDamage = 9_999;
+
         // ── Movement ──────────────────────────────────────────────────────────
 
         /// <summary>

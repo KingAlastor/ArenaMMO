@@ -62,7 +62,18 @@ When writing code or suggesting implementations for this project, you must stric
 
 ---
 
-## 4. How to Respond to Prompts
+## 4. Project Scope & Roadmap
+
+The full engineering goals are tracked in [`ROADMAP.md`](../ROADMAP.md), split into two phases:
+
+- **Phase 1 — Arena** is the **active development target**. Only implement systems listed under Phase 1. When suggesting new features or pointing out missing systems, scope your feedback to Phase 1 items.
+- **Phase 2 — MMO** (NPCs, pathfinding, aggro tables, XP/leveling, player-to-player trading, world persistence) is explicitly deferred. Do not implement or scaffold Phase 2 systems unless I explicitly ask.
+
+You do not need to read `ROADMAP.md` on every prompt. Refer to it only when I ask about project scope, implementation priorities, or what to build next.
+
+---
+
+## 5. How to Respond to Prompts
 
 When I ask you to write code, design features, or fix bugs:
 1. **Analyze Dependencies:** Identify if the logic belongs in `SharedLibrary`, `LobbyServer`, `GameServer`, or `UnityClient`.

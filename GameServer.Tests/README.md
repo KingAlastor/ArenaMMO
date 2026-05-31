@@ -394,6 +394,6 @@ Add to your `.github/workflows/test.yml`:
 
 ---
 
-**Last Updated:** May 29, 2026  
-**Test Framework Version:** 1.0.0  
+**Last Updated:** May 31, 2026 (round 7 — single-thread queue & spatial-grid audit)  
+**Test Framework Version:** 1.0.3  
 **Target Server Version:** ArenaMMO 0.1-alpha

@@ -359,7 +359,38 @@ For questions or contributions, see the full documentation:
 
 ---
 
-**Version:** 1.0.0  
-**Last Updated:** May 29, 2026  
+**Version:** 1.0.3  
+**Last Updated:** May 31, 2026  
 **Status:** Ready for production use  
 **Target Server:** ArenaMMO 0.1-alpha
+
+### Changelog
+
+#### May 31, 2026 — Delta compression broadcasting (round 8)
+- `PlayerSession`: added `LastBroadcastX`, `LastBroadcastY`, `LastBroadcastHealth` primitive sentinel fields.
+- `ArenaInstance.BroadcastState`: position packet skipped when fixed-point encoded X/Y matches last-tick sentinel; health packet skipped when encoded HP unchanged. Own-entity position always sent (client reconciliation requires `AcknowledgedTick` every tick). `EncodeTick24` called once before the viewer loop and the result shared across all position packets that tick.
+- `ArenaInstance.CommitBroadcastState`: new O(N) pass after all viewers are served that writes updated sentinels. Deferred update ensures all viewers in one tick see the same changed/unchanged decision for a given entity.
+- **Test impact:** tests that assert a position packet arrived should confirm the entity actually moved, or use `WaitForPositionUpdate()` (which blocks until a fresh packet is available). Stationary entities will not produce position or health packets for remote viewers.
+- ROADMAP item **2.4** promoted from 🔶 to ✅.
+
+#### May 31, 2026 — Single-thread queue & spatial-grid audit (round 7)
+- `ArenaInstance`: `ConcurrentQueue<T>` → `Queue<T>(16)` for all five action queues (`_attackQueue`, `_spellQueue`, `_shootQueue`, `_equipItemQueue`, `_pickupQueue`). All access is on the game-loop thread; eliminates per-`TryDequeue` `Interlocked.CompareExchange` overhead.
+- `ArenaInstance`: `GroundItem sealed class` → `struct`. Eliminates one heap allocation per item drop; `Dictionary<int, GroundItem>` stores values inline.
+- `ArenaInstance`: `_spatialGrid` initialised eagerly in `Start()` instead of lazily on first `ProcessTick`. Removes a per-tick null-branch executed 30×/second for the server's entire lifetime.
+- `ArenaInstance`: Three remaining `_spatialGrid?.QueryNeighbours(…) ?? (List)_players` null-conditionals removed from `BroadcastStatusEffect` and `BroadcastStatusEffectRemoval` AlliesOnly paths; replaced with direct `_spatialGrid!.QueryNeighbours(…)` calls consistent with the rest of the broadcast pipeline.
+- `PlayerStateSink`: Comment corrected — `Task.Run` has no state-passing overload; the closure cannot be eliminated without boxing `LivePlayerState`. Code unchanged; comment now explains the trade-off accurately.
+
+#### May 31, 2026 — Data-layer allocation audit (round 3)
+- `PlayerStateSink.FlushAsync`: replaced `async Task` (sync prelude on game-loop thread) with `Task.Run(() => FlushCoreAsync(...))` wrapper. String interpolation and `JsonSerializer.Serialize` now execute entirely on a thread-pool thread; the game-loop thread returns in nanoseconds.
+- `MatchDataService.LoadPlayerProfile` + `LoadPlayerProfileAsync`: replaced `raw.ToString()` with `(byte[])raw` + `bytes.AsSpan()` — eliminates the intermediate managed string copy of the Redis JSON payload.
+
+#### May 31, 2026 — Performance audit round 2
+- `ProjectileSystem.Tick` signature extended with `entityMap` parameter; `ApplyLifeSteal` is now O(1) instead of O(N).
+- `NetworkManager` `CombatEventPacket` / `AoEHitEventPacket` `SendToInterested` overloads now accept and use `SpatialGrid?`.
+- All 7 previously unguarded `SendToInterested` call sites in `ArenaInstance` now pass `_spatialGrid` (death, respawn, projectile destroy, ground item spawned/removed, combat/AoE events).
+
+#### May 31, 2026 — Performance audit round 1
+- Drift-free heartbeat, zero-alloc broadcast structs, spatial grid, static projectile scratch lists, plain Dictionary input drains.
+
+#### May 29, 2026 — Initial harness release
+- Core movement, cheat-detection, diagonal-normalization, and multi-client test cases.

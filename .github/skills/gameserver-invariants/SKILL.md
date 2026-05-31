@@ -53,12 +53,13 @@ This skill defines the gameplay and networking invariants Copilot must preserve 
 ## Simulation Model
 - Fixed tick loop at 30 Hz in ArenaInstance.
 - Tick order matters and should stay stable:
-  1. Movement input (consume latest PlayerInputPacket per peer, normalize, apply via `MovementSystem.ProcessInput(player, input, DeltaTime, _zone.Bounds)`)
+  0. `FinalizeHydration()` — drains completed async Redis profile reads from `_pendingHydration`; applies profiles to waiting sessions; re-enqueues incomplete tasks. Never blocks.
+  1. Movement input (consume latest `PlayerInputData` struct per peer from `_latestInputByPeer`; normalize; apply via `MovementSystem.ProcessInput(player, in input, DeltaTime, _zone.Bounds)`). **`_latestInputByPeer` is `Dictionary<NetPeer, PlayerInputData>` — the value type is `PlayerInputData` (struct), not `PlayerInputPacket` (class).** `EnqueueInput` copies the three scalar fields immediately to prevent LiteNetLib reusable-instance aliasing.
   2. Record position history — call `PlayerSession.RecordPositionHistory(_tick)` on every player immediately after movement
   3. Melee attacks
   4. Spell casts — drains spell queue; emits `CombatEventPacket` (via `_reusableSpellEvents`) and `AoEHitEventPacket` (via `_reusableAoEHitEvents`)
-  5. Shoot/projectile spawn
-  6. Projectile tick and resolution
+  5. Shoot/projectile spawn — mutates pre-allocated `_projSpawnPacket` struct, sends via `SendToInterested(in _projSpawnPacket, ...)`
+  6. Projectile tick and resolution — mutates pre-allocated `_projDestPacket` struct on hit/expiry
   7. Status effect tick processing — `TickStatusEffects` returns `bool statsChanged`; if `true` AND `player.Peer != null`, send `BuildStatsPacket()` to that peer
   8. Death detection — set `IsRespawning`, increment `DeathCount`/`KillCount`, broadcast `PlayerDeathPacket` via `SendToInterested`
   9. Respawn countdown — call `TickRespawn` per player; broadcast `PlayerRespawnPacket` via `SendToInterested` on return `true`
@@ -131,6 +132,9 @@ If a change affects one phase, validate the neighboring phases still operate cor
 - Prefer for-loops and reusable lists/buffers.
 - Avoid per-entity temporary object churn inside tick loops.
 - Keep checks branch-light and data-oriented in CombatSystem, ProjectileSystem, and ArenaInstance.
+- **`CombatSystem.ProcessSpellCast`, `ProcessAoE`, `ProcessMeleeSplash`, and `ProjectileSystem.Tick` / `ApplyExplosiveSplash` accept `List<PlayerSession>` (not `IReadOnlyList<PlayerSession>`).** Every `[i]` and `.Count` access in the AoE and projectile collision inner loops must be a direct array read (no vtable dispatch). Do not widen these parameters back to `IReadOnlyList` — at 2,000-player MMO scale that re-introduces ~12B virtual dispatch calls/second.
+- **`SecurityTelemetry.WriteAudit`, `PrintSnapshot`, and `RecordUnauthorizedSpell` must remain fully off-thread.** All string interpolation and `Console.WriteLine` I/O must be performed inside `ThreadPool.QueueUserWorkItem<TState>` callbacks with `static` lambdas and value-tuple `TState` arguments. Do not move these back onto the game-loop thread — under adversarial cheat floods these paths fire hundreds of times per tick.
+- **`NetworkManager.OnPeerConnected`, `OnPeerDisconnected`, and `OnNetworkError` must remain off-thread.** Log lines must be emitted via `ThreadPool.QueueUserWorkItem<TState>` with static lambdas. The address/endpoint string must be snapshotted before hand-off. Do not call `Console.WriteLine` directly in these event handlers.
 - `ArenaInstance._entityMap` (`Dictionary<int, PlayerSession>`) provides O(1) entity lookup by EntityId.
   - Keep it in sync with `_players` and `_peerMap` at all authentication and disconnect events.
   - Replace any O(N) linear `FindById` scans with a dictionary lookup against `_entityMap`.
@@ -216,7 +220,7 @@ If a change affects one phase, validate the neighboring phases still operate cor
 ## CombatSystem API Contract
 - `ProcessMeleeAttack` signature includes `int clientAttackTick` — always pass `entry.Packet.TickNumber` from the attack queue.
 - `ProcessSpellCast` returns `void` and accepts:
-  - `IReadOnlyList<PlayerSession> allPlayers` — used for AoE and MeleeSplash iteration.
+  - `List<PlayerSession> allPlayers` — used for AoE and MeleeSplash iteration. **Must be `List<T>`, not `IReadOnlyList<T>`** — eliminates vtable dispatch on every `[i]` and `.Count` in the collision loop.
   - `IReadOnlyDictionary<int, PlayerSession> entityMap` — O(1) lookup for single-target resolution; always pass `ArenaInstance._entityMap`.
   - `List<CombatEventPacket> results` — pre-allocated `_reusableSpellEvents` list; clear it before each call.
   - `List<AoEHitEventPacket> aoeResults` — pre-allocated `_reusableAoEHitEvents` list; clear it before each call. Used by `ProcessAoE` and `ProcessMeleeSplash`.
@@ -271,6 +275,9 @@ If a change affects one phase, validate the neighboring phases still operate cor
   - lifecycle events (`EntitySpawnPacket`, `EntityDespawnPacket`, `PlayerDeathPacket`, `PlayerRespawnPacket`, `MatchEndPacket`) use ReliableOrdered
 - `AoEHitEventPacket` is broadcast to all peers as ReliableOrdered, not AoI-filtered;
   clients may be beyond view radius but still want death/SFX feedback for AoE spells.
+- `StatusEffectAppliedPacket` and `StatusEffectRemovedPacket` are now **structs**. Always pass them by `in` reference to `NetworkManager.SendToInterested` / `SendTo` overloads. Do not store them as class references or pass them to the generic `SendToInterested<T>` path.
+- `ProjectileSpawnPacket` and `ProjectileDestroyPacket` are now **structs**. Use the pre-allocated `_projSpawnPacket` / `_projDestPacket` instance fields on `ArenaInstance`; mutate them before each send. Do not use `new ProjectileSpawnPacket` or `new ProjectileDestroyPacket` inside the tick loop.
+- `BroadcastStatusEffect` and `BroadcastStatusEffectRemoval` for `AlliesOnly` visibility now call `_spatialGrid.QueryNeighbours(target.Position)` to reduce the inner loop from O(N) to O(k). This is the same grid used by `BroadcastState`.
 
 ## Safety and Persistence
 - Do not add direct SQL access into active match simulation code.
@@ -278,10 +285,15 @@ If a change affects one phase, validate the neighboring phases still operate cor
 - Preserve queue-based separation between network receive and simulation processing.
 - Preserve auth-first flow: no gameplay intent should mutate state for unauthenticated peers.
 - `MatchDataService` (in `GameServer.DataLayer`) is the only data-access layer in GameServer.
-  - `LoadPlayerProfile(accountId)` reads a Redis-cached profile synchronously **only at connection time** (outside the tick loop).
+  - `LoadPlayerProfileAsync(accountId)` uses `await _redis.StringGetAsync(...).ConfigureAwait(false)` — **truly non-blocking**, zero ThreadPool thread occupation during the Redis round-trip. It **must** be called in `OnPlayerAuthenticated` (on the game-loop thread via `PollEvents`) — never the synchronous `LoadPlayerProfile`. The returned `Task<PlayerProfile?>` is enqueued into `_pendingHydration` alongside the session.
+  - `FinalizeHydration()` drains the `_pendingHydration` `ConcurrentQueue` at the **top of every `ProcessTick`**, applying profiles from completed tasks only. Pending tasks are re-enqueued. No blocking ever occurs on the tick thread.
+  - `LoadPlayerProfile(accountId)` (synchronous) still exists but must **only** be called from true off-tick contexts (tests, one-off tooling). Never call it from inside `OnPlayerAuthenticated`, `PollEvents`, `ProcessTick`, or `BroadcastState`. Calling it from `OnPlayerAuthenticated` blocks the game-loop thread for a full Redis round-trip (1–15 ms) and directly erodes the 33.33 ms tick budget.
   - `SaveMatchResultAsync(result)` is fire-and-forget; called once from `EndMatch` after `_isRunning = false`.
   - Postgres upsert is delegated to a background `Task.Run`; the tick loop never waits for it.
-  - Do not call any `MatchDataService` method from inside `ProcessTick` or `BroadcastState`.
+  - Do not call any `MatchDataService` method synchronously from inside `ProcessTick` or `BroadcastState`.
+- Avoid string interpolation (`$"...{variable}..."`) in methods that run on the game-loop thread, including `EvictExpiredGracePeriods`. Each interpolated string heap-allocates a new `string` object. Use separate `Console.Write` / `Console.WriteLine` calls with literal string arguments instead — literals are interned and zero-allocation.
+- `SecurityTelemetry.WriteAudit`, `PrintSnapshot`, and `RecordUnauthorizedSpell` are fully off-thread: they must use `ThreadPool.QueueUserWorkItem<TState>` with `static` lambdas and value-tuple `TState`. Do not call `Console.WriteLine` directly from these methods on the game-loop thread.
+- `NetworkManager.OnPeerConnected`, `OnPeerDisconnected`, and `OnNetworkError` must log via `ThreadPool.QueueUserWorkItem<TState>`. Snapping `peer.Address.ToString()` / `endPoint.ToString()` before hand-off is required because the address may become stale; the static lambda must capture nothing from the live LiteNetLib objects.
 - Configuration is loaded from `appsettings.json` + environment variables at startup via `Microsoft.Extensions.Configuration`.
   - `ARENA_TICKET_SECRET` must remain in an environment variable; do not move it into `appsettings.json`.
   - Redis and Postgres connection strings live in `appsettings.json:ConnectionStrings` and are overridable via env vars.
@@ -345,6 +357,7 @@ raw = baseDamage × attackPower
   3. Compute `CraftingIngredientReward[]` per player via `ComputeCraftingRewards`.
   4. Send `CraftingRewardPacket` to each non-null peer that earned rewards.
   5. Fire `SaveMatchResultAsync` for each session (fire-and-forget); `MatchResult.CraftingRewards` carries the rewards so the ProfileServer can credit them.
+- `ComputeCraftingRewards` must use the pre-allocated `_rewardScratch = new CraftingIngredientReward[1]` instance field on `ArenaInstance`. Mutate `_rewardScratch[0]` in-place and return the field reference. Do **not** use `new[] { ... }` — that heap-allocates on every call, which fires on the game-loop thread before `_isRunning` is fully observable as `false`. Return `Array.Empty<CraftingIngredientReward>()` for zero-reward cases (already heap-free via the shared empty singleton).
 - `CheckWinCondition()` delegates to `_zone.WinCondition.Evaluate(_players, _tick)` which returns `FactionId?`.
   - `EliminationWinCondition` (default): all surviving players belong to one faction.
   - `NoWinCondition.Instance`: always returns `null` (for MMO open-world zones).
@@ -397,13 +410,34 @@ raw = baseDamage × attackPower
 - Arena mode: `TakeSnapshot(includeInventory: false)`. MMO zones: `TakeSnapshot(includeInventory: true)`.
 - Zone handoff: publish `ZoneTransferPayload` to `zone-transfer:{targetZoneId}` after flushing state.
 - `CraftingIngredientReward[]` written to `crafting-reward:{accountId}` at Arena match end by `SaveMatchResultAsync`.
-- Do not call any `MatchDataService` or `PlayerStateSink` method from inside `ProcessTick`.
+- Do not call any `MatchDataService` or `PlayerStateSink` methods from inside `ProcessTick`.
+- **Async profile hydration pipeline (fully wired as of May 2026 audit):**
+  1. `OnPlayerAuthenticated` sets `session.Health = session.MaxHealth` immediately as a safe default, then calls `_dataService.LoadPlayerProfileAsync(accountId)` — returns a `Task<PlayerProfile?>` immediately without blocking. Internally uses `StringGetAsync` (truly async, zero ThreadPool occupation during wait).
+  2. The `(PlayerSession, Task<PlayerProfile?>)` pair is enqueued into `_pendingHydration` (`ConcurrentQueue`).
+  3. `FinalizeHydration()` (called as phase 0 of `ProcessTick`) dequeues entries, skips incomplete tasks (re-enqueues them), and applies completed profiles via `HydrateFromProfile`.
+  4. The tick thread is **never blocked** waiting for Redis. Players enter the match with base stats and receive their full profile within 1–10 ticks (typically < 1 tick on local Redis).
+  5. Do not regress this to `LoadPlayerProfile` (synchronous); that blocked the game-loop thread for the full Redis round-trip on every player connect event.
 
 ## ProjectileState Snapshot Contract
-- `ProjectileState` snapshots `DamageType` and `PierceChance` from the spell at spawn time.
+- `ProjectileState` is a **struct** (not a class). Do not convert it back to a class; that would reintroduce per-spawn heap allocation on the game-loop thread.
+- `ArenaInstance` stores projectiles in `ProjectileState[] _projectiles` (length 512) with a companion `int _projectileCount`. Do not replace this with `List<ProjectileState>` or any heap-backed collection.
+- `ProjectileState` snapshots `DamageType`, `PierceChance`, and **`OwnerFaction`** from the spell/shooter at spawn time.
 - These snapshots are immutable for the lifetime of the projectile.
 - Do not re-read spell stats from `SpellDatabase` during projectile tick resolution; use the snapshot.
+- `OwnerFaction` is snapshotted at spawn so that `MatchesFactionFilter` is O(1) — it uses a switch expression over `(filter, ownerFaction, candidate.Faction)`. Do **not** revert to scanning `allPlayers` to look up the owner's faction; that is O(N) per `(projectile × candidate)` pair.
 - This prevents a future in-flight mutation window if `SpellDatabase` ever becomes hot-reloadable.
+
+## ProjectileSystem API Contract
+- `TrySpawnProjectile(..., out ProjectileState result)` is the spawn API. It returns `bool` and writes the new projectile to the `out` parameter (stack-allocated, zero heap alloc). The caller stores it in `_projectiles[_projectileCount++]`.
+- Do not call `new ProjectileState { ... }` directly at the call site; always go through `TrySpawnProjectile`.
+- `ProjectileSystem.Tick(ProjectileState[] projectiles, ref int projectileCount, List<PlayerSession> players, float delta, SpatialGrid? grid)` — uses `ref ProjectileState proj = ref projectiles[i]` for in-place mutation (zero struct copy), and `SwapRemove` for O(1) removal. **`players` must be `List<PlayerSession>`, not `IReadOnlyList<PlayerSession>`** — same vtable-elimination reason as `ProcessSpellCast`.
+- `SwapRemove` replaces the removed slot with the last element and decrements the count — forward iteration with `i--` after removal preserves visit correctness.
+- Pass `_spatialGrid` to `Tick` and `SendToInterested` inside the projectile broadcast path. Do not remove the grid parameter.
+
+## ticksPerTick Invariant
+- `ticksPerTick` (the `Stopwatch` tick count per game tick) must be computed as `Stopwatch.Frequency / TickRate` (integer division).
+- Do **not** use `(long)(Stopwatch.Frequency * DeltaTime)` or any float-multiplication path. `1f/30f` is not exactly representable in IEEE 754; compounding rounding error causes phase drift over millions of ticks.
+- `DeltaTime` (`1f / TickRate`) is still used as a `float` for physics integration (movement, projectile position). Only the heartbeat deadline uses the integer path.
 
 
 - Server authority still intact for all touched mechanics.
@@ -416,6 +450,15 @@ raw = baseDamage × attackPower
 - `ProcessMeleeAttack` and `ProcessSingleTarget` still use historical position for range check.
 - `EntityPositionPacket.ServerTick` and `AcknowledgedTick` still populated in BroadcastState.
 - `PlayerInputPacket` axes remain `sbyte`; dequantization stays `value / 127f`.
+- `_latestInputByPeer` stores `PlayerInputData` **structs**, not `PlayerInputPacket` class references. `EnqueueInput` must copy the scalar fields into a `PlayerInputData` struct immediately on receipt — never store the raw class reference. LiteNetLib reusable instances are overwritten by the next inbound packet of the same type, which would silently alias multiple peers to the same data.
+- `ticksPerTick` must be `Stopwatch.Frequency / TickRate` (integer division). Do not use float multiplication.
+- `ProjectileState` must remain a **struct**. `_projectiles` must remain a fixed `ProjectileState[512]` array with a companion `_projectileCount` int.
+- `MatchesFactionFilter` must use the `OwnerFaction` field on `ProjectileState` (O(1) switch). Do not revert to an O(N) allPlayers scan.
+- `ProjectileSystem.TrySpawnProjectile` must write to an `out ProjectileState` — never `return new ProjectileState`.
+- `_projSpawnPacket` and `_projDestPacket` are pre-allocated struct instance fields on `ArenaInstance`. Mutate them in-place before each `SendToInterested` call inside the tick loop. Do not use `new ProjectileSpawnPacket` or `new ProjectileDestroyPacket` inside `ProcessTick`.
+- `StatusEffectAppliedPacket` and `StatusEffectRemovedPacket` are now structs. `TryApplyStatusEffect` writes them via `out` (stack-allocated). `TickStatusEffects` adds them to `List<struct>` (value storage). Always pass them by `in` reference to `NetworkManager` overloads.
+- `BroadcastStatusEffect`/`BroadcastStatusEffectRemoval` for `AlliesOnly` use `_spatialGrid.QueryNeighbours` — do not revert to iterating all `_players`.
+- `FinalizeHydration()` called as phase 0 of `ProcessTick` — do not remove this call or replace it with a synchronous `LoadPlayerProfile` call inside `OnPlayerAuthenticated`.
 - Packet semantics are still coherent with Unity client expectations.
 - Pre-auth gating, auth timeout, and IP abuse controls still protect connection ingress.
 - IntentGuard still enforces tick skew, replay resistance, and queue pressure limits.
@@ -452,6 +495,15 @@ raw = baseDamage × attackPower
 - New zone behaviors must be expressed as `ZoneDescriptor` fields or strategies, not `ArenaInstance` mode branches.
 - Any new `PlayerSession` method that changes stats must call `RecomputeStats()` and return `BuildStatsPacket()` to the caller.
 - Grace-period logic must not be bypassed. `TryValidateForRejoin` is only valid after grace-set membership is confirmed.
+- `OnPlayerAuthenticated` must use `LoadPlayerProfileAsync` + `_pendingHydration` enqueue. Never reintroduce `LoadPlayerProfile` (synchronous) at this call site. `LoadPlayerProfileAsync` must use `StringGetAsync` internally — never `Task.Run(blocking)` around `StringGet`.
+- `ticksPerTick` must use integer division (`Stopwatch.Frequency / TickRate`). Float-multiplication drift is a latent bug.
+- `ProjectileState` must remain a struct. Revert-to-class PRs are rejected.
+- `MatchesFactionFilter` must remain O(1) (switch on `OwnerFaction`). Revert-to-O(N)-scan PRs are rejected.
+- `ComputeCraftingRewards` must use the pre-allocated `_rewardScratch` field — never `new[] { ... }` inside the method body.
+- New game-loop-thread logging must use separate `Console.Write`/`WriteLine` literal calls, not string interpolation.
+- `CombatSystem.ProcessSpellCast` / `ProcessAoE` / `ProcessMeleeSplash` and `ProjectileSystem.Tick` / `ApplyExplosiveSplash` must accept `List<PlayerSession>`, not `IReadOnlyList<PlayerSession>`. Widening to the interface re-introduces vtable dispatch on every inner-loop element access.
+- `SecurityTelemetry` audit/snapshot methods must remain off-thread (`ThreadPool.QueueUserWorkItem<TState>` with static lambdas). Do not move string interpolation or `Console.WriteLine` back onto the game-loop thread.
+- `NetworkManager.OnPeerConnected`, `OnPeerDisconnected`, and `OnNetworkError` must log off-thread. Do not add inline `Console.WriteLine` calls to these handlers.
 
 ## If Extending Mechanics
 When adding new mechanics, preserve these invariants:

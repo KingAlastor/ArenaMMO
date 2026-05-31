@@ -23,6 +23,7 @@ A server-authoritative, real-time multiplayer arena game built with .NET 7 and U
 10. [Running Locally](#running-locally)
 11. [Testing](#testing)
 12. [Technology Stack](#technology-stack)
+13. [Roadmap](#roadmap)
 
 ---
 
@@ -68,9 +69,11 @@ ArenaMMO/
 │   └── WorldBounds.cs
 │
 ├── GameServer/             # net7.0 — real-time arena simulation
-│   ├── ArenaInstance.cs    # Core match container & tick driver
+│   ├── ArenaInstance.cs    # Core match container & drift-free tick driver
 │   ├── NetworkManager.cs   # LiteNetLib glue
 │   ├── PlayerSession.cs    # Per-player authoritative state
+│   ├── SpatialGrid.cs      # Fixed-cell 2-D spatial hash for O(k) interest queries
+│   ├── IInterestFilter.cs  # BroadcastFilter / RadiusFilter strategies
 │   ├── AuthTicketValidator.cs
 │   ├── IntentGuard.cs      # Rate-limiting & anti-cheat
 │   ├── InputSanitizer.cs
@@ -80,7 +83,7 @@ ArenaMMO/
 │   ├── Systems/
 │   │   ├── CombatSystem.cs
 │   │   ├── MovementSystem.cs
-│   │   └── ProjectileSystem.cs
+│   │   └── ProjectileSystem.cs  # Static scratch lists — zero per-tick allocation
 │   └── DataLayer/
 │       ├── MatchDataService.cs
 │       ├── LivePlayerState.cs
@@ -120,14 +123,43 @@ ArenaMMO/
 
 **Target:** `netstandard2.1` — consumed by every server project *and* the Unity client.
 
-`NetworkPackets.cs` is the protocol contract. It defines every packet exchanged over the wire, typed into two groups:
+`NetworkPackets.cs` is the protocol contract. Packets are split into two tiers:
+
+**Hot-path structs** — `[StructLayout(Sequential, Pack=1)]` value types, written directly to `NetDataWriter`. Zero heap allocation per send.
+
+| Struct | Wire size | Compression |
+|--------|-----------|-------------|
+| `EntityPositionPacket` | 15 B | X/Y as `short` fixed-point (scale ×16, precision 0.0625 units); tick fields use 24-bit wrapping encoding (`ushort lo` + `byte hi`, 3 B each) via `PacketEncoding.EncodeTick24`/`DecodeTick24` — saves 2 B vs prior `int` layout |
+| `EntityHealthPacket` | 7 B | `Health` as `ushort` raw HP |
+| `CombatEventPacket` | 12 B | `Damage` compressed from `int` (4 B) to `ushort` (2 B, max 65,535); `IsCritical` + future flags in 1-byte `Flags` field |
+| `AoEHitEventPacket` | 16 B | `Damage` likewise compressed to `ushort`; same flags packing |
+| `StatusEffectAppliedPacket` | 15 B | `Visibility` packed into `byte VisibilityFlags` bit 0; was ~40 B as a class |
+| `StatusEffectRemovedPacket` | 10 B | Same visibility packing; was ~24 B as a class |
+| `ProjectileSpawnPacket` | 25 B | Direction compressed to `short×32767`; speed/range to `ushort×10`; was ~60 B as a class |
+| `ProjectileDestroyPacket` | 6 B | `HitSomething` packed into `byte Flags` bit 0; was ~24 B as a class |
+| `EntityDespawnPacket` | 5 B | Converted from class |
+| `PlayerDeathPacket` | 9 B | Converted from class |
+| `PlayerRespawnPacket` | 11 B | X/Y as `short` fixed-point, `Health` as `ushort` |
+| `MatchEndPacket` | 2 B | Converted from class |
+| `GroundItemSpawnedPacket` | 13 B | X/Y as `short` fixed-point |
+| `GroundItemRemovedPacket` | 5 B | Converted from class |
+| `ItemAddedToInventoryPacket` | 9 B | Converted from class |
+| `PlayerGraceDisconnectPacket` | 5 B | Converted from class |
+| `PlayerReconnectedPacket` | 5 B | Converted from class |
+| `PlayerStatsRefreshedPacket` | 20 B | Stat fractions as `ushort×10000` |
+
+`Vec2` also carries `[StructLayout(Sequential, Pack=1)]` for guaranteed cross-platform blittability.
+
+**Infrequent classes** — sent at most once per event (spawn, match flow); retain `NetPacketProcessor` compatibility because they carry `string` fields.
 
 | Direction | Packets |
-|-----------|---------|
+|-----------|--------|
 | Client → Server | `PlayerInputPacket`, `AttackRequestPacket`, `SpellCastRequestPacket`, `ShootRequestPacket`, `GearSetSwapRequestPacket`, `EquipItemRequestPacket`, `AuthTicketPacket`, `GroundItemPickupRequestPacket` |
-| Server → Client | `EntityPositionPacket`, `EntityHealthPacket`, `CombatEventPacket`, `AoEHitEventPacket`, `StatusEffectAppliedPacket`, `StatusEffectRemovedPacket`, `ProjectileSpawnPacket`, `ProjectileDestroyPacket`, `EntitySpawnPacket`, `PlayerGraceDisconnectPacket`, `PlayerReconnectedPacket` |
+| Server → Client (classes) | `EntitySpawnPacket`, `CraftingRewardPacket`, `LobbyLoginResponsePacket`, `MatchFoundPacket` |
 
 Movement input uses **quantized `sbyte` axes** (`-127..127` → `-1..1`). This eliminates floating-point NaN/Inf and ensures identical dequantization on client and server.
+
+`PacketEncoding` provides `EncodePosition`/`DecodePosition`, `EncodeHealth`/`DecodeHealth`, `EncodeDirection`/`DecodeDirection` (unit vector → `short×32767`), `EncodeSpeed`/`DecodeSpeed` (`float` → `ushort×10`), and `EncodeTick24`/`DecodeTick24` (24-bit wrapping tick, `ushort lo` + `byte hi`) helpers shared by the server and Unity client. `PacketId` constants are the dispatch discriminators written as the first byte of each struct packet.
 
 After build, a `CopyToUnity` MSBuild target automatically copies `SharedLibrary.dll` and `LiteNetLib.dll` into `UnityClient/Assets/Plugins/` so the Unity project always stays in sync.
 
@@ -209,15 +241,21 @@ The authoritative real-time simulation. All game state mutations happen here; cl
 
 `ArenaInstance` is the central container for one live match (or zone). It:
 
-- Owns a `List<PlayerSession>` and peer/entity lookup dictionaries
-- Runs the 30 Hz fixed-tick game loop on the main thread
-- Drains three `ConcurrentQueue`s and one `ConcurrentDictionary` per tick:
-  - `_latestInputByPeer` — latest movement intent per client (last-wins)
+- Owns a `List<PlayerSession>` and peer/entity lookup dictionaries, plus a pre-allocated `ProjectileState[512]` fixed array (zero heap allocation per projectile spawn)
+- Runs a **drift-free 30 Hz fixed-tick game loop** using absolute `Stopwatch` deadlines; `ticksPerTick = Stopwatch.Frequency / TickRate` uses integer division (no float rounding bias) with a `Thread.SpinWait` final sub-millisecond window
+- Loads player profiles via a **fully async deferred-hydration pipeline**: `OnPlayerAuthenticated` fires `LoadPlayerProfileAsync` (which uses `StringGetAsync` — truly non-blocking, zero ThreadPool occupation during the wait) and enqueues the `(session, Task<PlayerProfile?>)` pair into `_pendingHydration`; `FinalizeHydration()` drains completed tasks at the top of every tick — the game-loop thread is never blocked on Redis I/O. `LoadPlayerProfileAsync` deserializes via `(byte[])raw` + `bytes.AsSpan()` (no intermediate `string` copy)
+- **`PlayerStateSink.FlushAsync`** returns `Task.Run(() => FlushCoreAsync(...))` so the game-loop thread never executes the synchronous prelude (string interpolation + `JsonSerializer.Serialize`) — all data-layer CPU work is fully offloaded to the thread pool
+- Drains three `ConcurrentQueue`s for action intents per tick:
   - `_attackQueue` — melee attack requests
   - `_spellQueue` — spell cast requests
   - `_shootQueue` — projectile shoot requests
+- Drains `_latestInputByPeer` and `_latestGearSwapByPeer` via **plain `Dictionary` with struct enumerator** (zero heap allocation) — both are written and read exclusively on the game-loop thread
 - Delegates physics to `MovementSystem`, `CombatSystem`, and `ProjectileSystem`
-- Calls `BroadcastState()` at the end of every tick
+- Calls `BroadcastState()` at the end of every tick using **pre-allocated struct instances** (`EntityPositionPacket`, `EntityHealthPacket`, `PlayerDeathPacket`, `PlayerRespawnPacket`, `GroundItemRemovedPacket`, `ItemAddedToInventoryPacket`) that are mutated in-place and passed via `in`-ref — zero per-tick GC allocations across all broadcast paths
+- All `TickResult` list fields from `ProjectileSystem.Tick` are iterated via **index-based `for` loops** (not `foreach`) to eliminate `List<T>.Enumerator` overhead on the projectile collision hot path
+- `_pendingHydration` is a plain **`Queue<T>`** (not `ConcurrentQueue<T>`) — all accesses are on the game-loop thread; eliminates `Interlocked`/`volatile` overhead that `ConcurrentQueue` adds unnecessarily
+- **`SecurityTelemetry` fully off-thread**: `WriteAudit`, `PrintSnapshot`, and `RecordUnauthorizedSpell` use `ThreadPool.QueueUserWorkItem<TState>` with `static` lambdas and value-tuple `TState` arguments — zero string allocation and zero `Console.WriteLine` I/O on the game-loop thread, including under adversarial cheat-flood conditions
+- **`NetworkManager` connection logging off-thread**: `OnPeerConnected`, `OnPeerDisconnected`, and `OnNetworkError` offload their log lines to `ThreadPool.QueueUserWorkItem<TState>` — the address string is snapshotted before hand-off so the callback captures nothing from the live peer object
 - Supports **Dota 2-style grace-period reconnect**: disconnected sessions are kept alive as stationary ghosts for `RejoinGraceTicks` ticks; the peer is reattached on rejoin without creating a new entity
 
 #### ZoneDescriptor
@@ -232,11 +270,30 @@ This lets the same `ArenaInstance` code host an arena match or an open-world MMO
 
 #### Interest Management
 
-`BroadcastState()` uses a **view-radius filter** (`IInterestFilter`) — only packets for entities within `ViewRadius` units are sent to each client. The view radius is pre-squared (`_viewRadiusSqr`) to avoid a `sqrt` on every entity pair every tick.
+`BroadcastState()` routes through a **`SpatialGrid`** and an **`IInterestFilter`** — only entities within `ViewRadius` units of each viewer are transmitted.
+
+- **`SpatialGrid`** (`GameServer/SpatialGrid.cs`): a fixed uniform-cell 2-D spatial hash rebuilt once per tick after movement. `QueryNeighbours(origin)` returns the pre-allocated 3×3 neighbourhood scratch list in O(1) cell lookup + O(k) iteration — no heap allocation. Reduces `BroadcastState` from O(N²) to O(N × k) where k ≪ N at MMO scale.
+- **`IInterestFilter`** strategy interface: `BroadcastFilter` (Arena default, all peers) or `RadiusFilter` (open-world, distance check) — swappable per zone via `ZoneDescriptor.EventFilter`.
+- The view radius is pre-squared (`_viewRadiusSqr`) to avoid a `sqrt` on every entity pair every tick.
+- `NetworkManager.SendToInterested` accepts an optional `SpatialGrid` on **all** overloads — including `CombatEventPacket` and `AoEHitEventPacket` — so every event broadcast benefits from grid-narrowing at high player counts. All 9 call sites in `ArenaInstance` now pass `_spatialGrid`, covering: combat events, AoE events, projectile spawn/destroy, death, respawn, ground item spawned/removed.
+
+| CCU | Old BroadcastState | New BroadcastState |
+|-----|-------------------|--------------------|
+| 20 (Arena) | O(400) / tick | O(~400) / tick (same) |
+| 2 000 (MMO) | O(4 000 000) / tick | O(~80 000) / tick (~50× faster) |
 
 #### Projectile System
 
-Ranged attacks (`ShootRequestPacket`) spawn a `ProjectileState` on the server. Each tick `ProjectileSystem` advances all active projectiles, checks collisions, and emits `ProjectileSpawnPacket` / `ProjectileDestroyPacket`. The client interpolates visual movement independently between server ticks.
+Ranged attacks (`ShootRequestPacket`) spawn a `ProjectileState` struct on the server. Each tick `ProjectileSystem` advances all active projectiles, checks collisions, and emits `ProjectileSpawnPacket` / `ProjectileDestroyPacket`. The client interpolates visual movement independently between server ticks.
+
+- **`ProjectileState` is a `struct`** stored in a pre-allocated `ProjectileState[512]` fixed array on `ArenaInstance`. Eliminated the heap allocation that occurred on every spawn when it was a `sealed class`.
+- **`TrySpawnProjectile`** (replaces the old `SpawnProjectile? return` pattern): writes the new struct directly into an `out ProjectileState` parameter — zero heap allocation end-to-end.
+- **`OwnerFaction`** is snapshotted into `ProjectileState` at spawn time, making `MatchesFactionFilter` O(1) (single enum comparison) instead of the previous O(N) linear scan through all players on every collision check.
+- **Array-based `Tick`**: `ProjectileSystem.Tick` now accepts `ProjectileState[]` + `ref int projectileCount` and removes projectiles via an O(1) swap-remove (`SwapRemove`) rather than `List.RemoveAt` which shifts all subsequent elements.
+- **Spatial grid collision narrowing**: `Tick` accepts `SpatialGrid?`; when present it calls `grid.QueryNeighbours(proj.Position)` to narrow collision candidates from O(N-all-players) to O(k-nearby) — critical at MMORPG scale.
+- **O(1) life-steal resolution**: `Tick` now also accepts `IReadOnlyDictionary<int, PlayerSession> entityMap`. `ApplyLifeSteal` uses a single `TryGetValue` hash probe to find the shooter instead of the previous O(N) linear scan through all players. At 2,000 players × 100 projectile hits/tick this eliminates 200,000 redundant iterations per tick.
+- Result lists (`hits`, `pierceHits`, `splashHits`, `expiredIds`, `statusEffects`) are **static pre-allocated scratch lists** cleared at the start of each `Tick` call. Callers must consume list contents before the next tick.
+- **`IReadOnlyList<PlayerSession>` → `List<PlayerSession>`**: `CombatSystem.ProcessSpellCast`, `ProcessAoE`, `ProcessMeleeSplash`, and `ProjectileSystem.Tick` / `ApplyExplosiveSplash` all narrowed from `IReadOnlyList` to `List` — the same fix previously applied to `BroadcastStatusEffects`. Every `[i]` and `.Count` access in the AoE and projectile collision inner loops is now a direct array read with no vtable dispatch (eliminates up to ~12B virtual calls/s at 2,000-player MMO scale).
 
 #### Grace-Period Reconnect
 
@@ -304,8 +361,9 @@ The Unity project lives in `UnityClient/Assets/Scripts/`. It consumes `SharedLib
    - Allowed spell list parsed
          │
          ▼
-8. PlayerSession created; entity spawned; EntitySpawnPacket → all peers
-   Profile hydrated from PostgreSQL (stats, gear)
+8. PlayerSession created; entity spawned; `EntitySpawnPacket` → all peers
+   Async Redis profile load fired immediately (non-blocking); session enters match with base stats.
+   Profile applied by `FinalizeHydration()` on first completed tick (~1–10 ticks, imperceptible).
          │
          ▼
 9. Live match (30 Hz simulation)
@@ -323,35 +381,39 @@ The Unity project lives in `UnityClient/Assets/Scripts/`. It consumes `SharedLib
 The game loop runs at a fixed **30 Hz** (`TickRate = 30`, `DeltaTime = 1/30 s`). Each tick:
 
 ```
-RunGameLoop()
+RunGameLoop()  ← absolute-deadline heartbeat: tracks nextTickTime = Stopwatch.GetTimestamp()
  ├── NetworkManager.PollEvents()          // drain OS receive buffer
- ├── DrainClientIntents()
- │    ├── _latestInputByPeer   → MovementSystem
- │    ├── _attackQueue         → CombatSystem
- │    ├── _spellQueue          → CombatSystem
- │    ├── _shootQueue          → ProjectileSystem
- │    └── _equipItemQueue / _pickupQueue
  ├── ProcessTick()
- │    ├── Expire grace-period sessions
- │    ├── MovementSystem.ProcessMovement()
- │    │    └── ValidateDelta, ClampToBounds, ApplyPosition
- │    ├── CombatSystem.ProcessAttacks()
- │    │    └── Melee, Spell (AoE / Single-target / MeleeSplash)
- │    ├── CombatSystem.TickStatusEffects()
- │    │    └── DoT/HoT application, expiry
- │    ├── ProjectileSystem.Tick()
- │    │    └── Advance positions, collision, destroy
+ │    ├── FinalizeHydration()             // phase 0: drain completed async Redis profile reads (zero blocking)
+ │    ├── Drain _latestInputByPeer        // plain Dictionary<NetPeer,PlayerInputData> struct enumerator, zero-alloc
+ │    │    └── → MovementSystem.ProcessInput()   // accepts in PlayerInputData (value-type copy, not class ref)
+ │    ├── SpatialGrid.RebuildEachTick()   // O(cells + N), once per tick after movement
+ │    ├── Drain _attackQueue  → CombatSystem.ProcessMeleeAttack()
+ │    ├── Drain _spellQueue   → CombatSystem.ProcessSpellCast()
+ │    ├── Drain _shootQueue   → ProjectileSystem.TrySpawnProjectile()  // out ProjectileState → _projectiles[count++]
+ │    │    └── mutates pre-alloc _projSpawnPacket struct; SendToInterested with _spatialGrid (zero alloc)
+ │    ├── ProjectileSystem.Tick(array, ref count, entityMap, grid)  // ref locals, SwapRemove, O(k) collision via grid
+ │    │   ApplyLifeSteal uses entityMap (O(1) hash probe) — was O(N) allPlayers scan per hit
+ │    │   TickResult lists iterated via index-based for loops (no List<T>.Enumerator overhead)
+ │    └── mutates pre-alloc _projDestPacket struct on hit/expiry; SendToInterested passes _spatialGrid (zero alloc)
+ │    ├── TickStatusEffects()             // DoT/HoT, expiry — StatusEffectApplied/Removed emitted as structs
+ │    ├── Death / Respawn detection       // _deathPacket / _respawnPacket mutated in-place; SendToInterested passes _spatialGrid (zero alloc)
+ │    ├── Drain _equipItemQueue / _pickupQueue  // _groundRemovedPacket / _itemAddedPacket mutated in-place; SendToInterested passes _spatialGrid (zero alloc)
  │    └── IWinCondition.Check()
  ├── BroadcastState()
- │    ├── EntityPositionPacket per visible entity
- │    ├── EntityHealthPacket (filtered by visibility)
- │    ├── CombatEventPackets
- │    ├── StatusEffect packets
- │    └── Projectile packets
- └── Frame regulation (sleep to maintain 33 ms/tick)
+ │    ├── SpatialGrid.QueryNeighbours(viewer) → O(k) neighbour list
+ │    ├── EntityPositionPacket: sent only when encoded X/Y differs from LastBroadcastX/Y (delta compression)
+ │    │   Own-entity position always sent (AcknowledgedTick field required for client reconciliation)
+ │    │   EncodeTick24 called ONCE before the viewer loop; shared serverTickLo/Hi reused per packet
+ │    ├── EntityHealthPacket: sent only when encoded Health differs from LastBroadcastHealth
+ │    └── CommitBroadcastState() — O(N) pass updates LastBroadcastX/Y/Health sentinels AFTER all viewers served
+ └── Frame regulation:
+      ├── Thread.Sleep(sleepMs - 1)       // coarse OS sleep
+      └── Thread.SpinWait(8) loop         // sub-ms spin to hit deadline precisely
+         nextTickTime += ticksPerTick     // = Stopwatch.Frequency / TickRate (integer division — exact, zero float bias)
 ```
 
-All game state is mutated **only** on this single loop thread. The `ConcurrentQueue`/`ConcurrentDictionary` input buffers are the only shared data structures between the network I/O path and the simulation.
+All game state is mutated **only** on this single loop thread. `ConcurrentQueue`s are used only for action intents (attack/spell/shoot) which may arrive from a future dedicated I/O thread. Movement and gear-swap inputs use plain `Dictionary` since LiteNetLib callbacks fire synchronously on the game-loop thread via `PollEvents()`.
 
 ---
 
@@ -374,18 +436,31 @@ All network I/O uses **LiteNetLib 2.1.4** over UDP with optional reliability lay
 
 ### Server → Client
 
-| Packet | Notes |
-|--------|-------|
-| `EntitySpawnPacket` | Sent to all peers on join, and to joiner for existing peers |
-| `EntityPositionPacket` | Every tick; includes `ServerTick` + `AcknowledgedTick` for client reconciliation |
-| `EntityHealthPacket` | Filtered — allies/enemies see different data |
-| `CombatEventPacket` | Melee or single-target spell hit |
-| `AoEHitEventPacket` | One packet per entity hit in an AoE; client groups by `CasterId+SpellId` |
-| `StatusEffectAppliedPacket` / `StatusEffectRemovedPacket` | Filtered by `StatusEffectVisibility` |
-| `ProjectileSpawnPacket` | Client uses `Speed` + `DirectionX/Y` to interpolate visuals |
-| `ProjectileDestroyPacket` | Includes `HitSomething` flag |
-| `PlayerGraceDisconnectPacket` | Peer dropped; grace period active |
-| `PlayerReconnectedPacket` | Peer rejoined |
+Hot-path packets (sent every tick or on every combat event) are **`[StructLayout(Sequential, Pack=1)]` value types** written directly to `NetDataWriter` — bypassing reflection-based serialisation and eliminating per-send heap allocations. Infrequent packets (spawn, respawn, match flow) remain as classes.
+
+| Packet | Type | Wire size | Notes |
+|--------|------|-----------|-------|
+| `EntityPositionPacket` | **struct** | 15 B | X/Y as `short` fixed-point (÷16, ±2048 range); `ServerTick`/`AcknowledgedTick` encoded as 24-bit wrapping values (`ushort lo` + `byte hi`, 3 B each) via `PacketEncoding.EncodeTick24` — saves 2 B vs prior `int` layout; use `DecodeTick24(lo, hi)` on the Unity client |
+| `EntityHealthPacket` | **struct** | 7 B | `Health` as `ushort` raw HP (was `float`, saves 2 B) |
+| `CombatEventPacket` | **struct** | 12 B | `Damage` as `ushort` (was `int`, saves 2 B); `IsCritical` packed into `byte Flags` bit 0 |
+| `AoEHitEventPacket` | **struct** | 16 B | `Damage` as `ushort` (was `int`, saves 2 B); `IsCritical` packed into `byte Flags` bit 0 |
+| `EntityDespawnPacket` | **struct** | 5 B | Converted from class; −11 B vs object header |
+| `PlayerDeathPacket` | **struct** | 9 B | Converted from class |
+| `PlayerRespawnPacket` | **struct** | 11 B | X/Y compressed to `short`, Health to `ushort` |
+| `MatchEndPacket` | **struct** | 2 B | Converted from class |
+| `GroundItemSpawnedPacket` | **struct** | 13 B | X/Y compressed to `short` |
+| `GroundItemRemovedPacket` | **struct** | 5 B | Converted from class |
+| `ItemAddedToInventoryPacket` | **struct** | 9 B | Converted from class |
+| `PlayerGraceDisconnectPacket` | **struct** | 5 B | Converted from class |
+| `PlayerReconnectedPacket` | **struct** | 5 B | Converted from class |
+| `PlayerStatsRefreshedPacket` | **struct** | 20 B | Stat fractions compressed to `ushort×10000` |
+| `StatusEffectAppliedPacket` | **struct** | 15 B | Converted from class (was ~40 B); `Visibility` packed into `byte VisibilityFlags` bit 0 |
+| `StatusEffectRemovedPacket` | **struct** | 10 B | Converted from class (was ~24 B) |
+| `ProjectileSpawnPacket` | **struct** | 25 B | Converted from class (was ~60 B); direction compressed to `short×32767`, speed/range to `ushort×10` |
+| `ProjectileDestroyPacket` | **struct** | 6 B | Converted from class (was ~24 B); `HitSomething` packed into `byte Flags` bit 0 |
+| `EntitySpawnPacket` | class | variable | Sent once on join; carries `string PlayerName` |
+
+`PacketEncoding` helpers: `EncodePosition(float) → short` / `DecodePosition(short) → float` and `EncodeHealth(float) → ushort` / `DecodeHealth(ushort) → float` are in `SharedLibrary/NetworkPackets.cs` for use on both server and Unity client.
 
 ---
 
@@ -580,6 +655,73 @@ ArenaInstance (30 Hz)
 | `Movement_CheatDetection_IllegalTeleportRejected` | Server clamps excessive deltas; reconciliation sent to client; other players see correct position |
 | `Movement_DiagonalInput_NormalizedAndBounded` | Diagonal movement doesn't exceed per-axis speed via normalization |
 | `Movement_MultipleClients_IndependentMovement` | Two simultaneous clients move independently with no cross-talk |
+
+---
+
+### Changelog
+
+#### May 31, 2026 — Delta compression broadcasting (round 8)
+
+| Area | Change |
+|------|--------|
+| `PlayerSession.cs` | Added three dirty-tracking sentinel fields: `internal short LastBroadcastX`, `LastBroadcastY` (initialized to `short.MinValue` — outside the valid ±2048 world-unit range so the first tick always sends), and `internal ushort LastBroadcastHealth` (initialized to `ushort.MaxValue`). All three are primitive value types — zero GC cost. |
+| `ArenaInstance.BroadcastState` | Position packet now suppressed when `PacketEncoding.EncodePosition(entity.Position.X/Y)` matches `entity.LastBroadcastX/Y` from last tick. Exception: own-entity position is always sent so the `AcknowledgedTick` field reaches the client every tick for input reconciliation. Health packet likewise suppressed when encoded HP is unchanged. `EncodeTick24` called once before the viewer loop (shared `serverTickLo/Hi` written into every position packet this tick — eliminates a redundant call per entity per viewer). |
+| `ArenaInstance.CommitBroadcastState` | New private method called once per tick **after** `BroadcastState` finishes iterating all viewers. Updates `LastBroadcastX/Y/Health` for every player in a single O(N) pass. Updating sentinels inside the inner loop would cause viewer[1] to see "unchanged" for an entity that viewer[0] just broadcast in the same tick — the deferred commit ensures a consistent decision across all viewers. |
+| Bandwidth impact | At ~10 % entity-moved-per-tick rate (typical open-world zone): 2,000 players × 20 viewers × 30 Hz × 90 % skip rate = **1,080,000 position packets/s eliminated**. In the arena (10-20 players, small map, most players moving) the reduction is minimal — no regression. |
+| ROADMAP 2.4 | Promoted from 🔶 to ✅. |
+
+#### May 31, 2026 — Concurrency audit & compile-error fixes (round 6)
+
+| Area | Change |
+|------|--------|
+| `NetworkManager.cs` — `EntityPositionPacket` serialiser | **Critical bug fixed.** `SendTo(NetPeer, in EntityPositionPacket, …)` was writing non-existent fields `packet.ServerTick` and `packet.AcknowledgedTick` (deleted in round 5's 24-bit encoding migration). Updated to write the correct six fields: `ServerTickLo`, `ServerTickHi`, `AcknowledgedTickLo`, `AcknowledgedTickHi`. Without this fix every position packet sent corrupt tick data, breaking client-side lag compensation and interpolation on every tick. |
+| `NetworkManager.cs` — `_pendingAuthPeers` / `_ipGuards` | Changed from `ConcurrentDictionary` to plain `Dictionary`. All LiteNetLib callbacks fire synchronously inside `PollEvents()` on the single game-loop thread — there is no concurrent access. `ConcurrentDictionary.foreach` returns a heap-allocated boxed `IEnumerator<KVP>` (no public struct enumerator), causing a GC allocation on **every tick** in `DisconnectAuthTimeoutPeers`. `Dictionary.Enumerator` is a public value-type struct — zero allocation. Also eliminates `GetOrAdd(key, _ => new …)` factory delegate allocations on the common (already-exists) path. |
+| `NetworkManager.cs` — `EvictStaleIpGuards` | Added pre-allocated `_staleIpAddresses` scratch `List<IPAddress>`. Previously `_ipGuards.Remove(entry.Key)` was called inside the `foreach` enumeration loop, which throws `InvalidOperationException` on plain `Dictionary`. Now collects keys in a first pass, removes in a second pass — same two-pass pattern as `_timedOutPeers`. |
+| `IntentGuard.cs` — `_peerGuards` | Changed from `ConcurrentDictionary` to plain `Dictionary` for the same reasons as `NetworkManager`. All callers (`TryAcceptIntent`, `TryReserveActionSlot`, `ReleaseActionSlot`, `OnPeerConnected`, `OnPeerDisconnected`) are invoked on the game-loop thread. Replaced `GetOrAdd(peer, _ => new …)` with `TryGetValue` + conditional `Dictionary` insert to avoid the factory delegate allocation on the hot path. |
+| `IntentGuard.cs` — `Console.WriteLine` in violation handlers | Moved off the game-loop thread. String interpolation (`$"[Guard] Disconnecting peer {peer.Id}..."`) allocates a `string` on the GC heap every time a violation fires. Replaced with `ThreadPool.QueueUserWorkItem(static id => Console.WriteLine(…), peer.Id)` — the `static` keyword enforces at compile time that the lambda captures nothing, eliminating the closure object. |
+| `ArenaInstance.cs` — `EvictExpiredGracePeriods` | Replaced `Task.Run(() => Console.WriteLine($"…{expiredName}…"))` with `ThreadPool.QueueUserWorkItem(static name => Console.WriteLine(…), grace.Session.PlayerName)`. Eliminates the compiler-generated display class (closure), the captured `string expiredName` local, and the `Task`/`QueueSegment` overhead of `Task.Run`. |
+| `CombatSystem.cs`, `ProjectileSystem.cs`, `PlayerSession.cs` | Replaced raw `(ushort)Math.Clamp(damage, 0, 65535)` at all six `Damage` assignment sites with `DamageUtils.ClampAndEncode(damage, attackerId, context)`. The cap is now `CombatMath.MaxSingleHitDamage = 9_999` — ~10× above the design ceiling of ~1,000. Any value reaching the cap fires `SecurityTelemetry.RecordDamageCap(attackerId, context, rawDamage)` (off the game-loop thread via `ThreadPool.QueueUserWorkItem`) and increments a `damageCapHits` counter visible in the periodic telemetry snapshot. A non-zero `damageCapHits` in production logs indicates a runaway damage formula bug. Context labels: `"melee"`, `"spell"`, `"aoe"`, `"projectile"`, `"splash"`, `"dot"`. |
+
+#### May 31, 2026 — Struct compression & allocation audit (round 5)
+
+| Area | Change |
+|------|--------|
+| `EntityPositionPacket` | `ServerTick` and `AcknowledgedTick` (`int`, 4 B each) replaced with 24-bit wrapping layout: `ushort TickLo` + `byte TickHi` (3 B each). Wire size: **17 → 15 bytes**. Wraps after 16,777,216 ticks ≈ 154 h at 30 Hz. At 2,000 players × 20 viewers × 30 Hz this saves **2.4 MB/s** of outbound bandwidth. `PacketEncoding.EncodeTick24`/`DecodeTick24` helpers added to `SharedLibrary`. |
+| `CombatEventPacket.Damage` | Changed from `int` (4 B) to `ushort` (2 B). Wire size: **13 → 12 bytes**. No game damage value exceeds 65,535; server clamps before assignment. |
+| `AoEHitEventPacket.Damage` | Same `int`→`ushort` change for consistency. Wire size: **17 → 16 bytes**. |
+| `ArenaInstance._reusableStatusEffects` / `_reusableSpellEvents` / `_reusableAoEHitEvents` / `_statusTickEvents` / `_expiredStatusEffects` | Added explicit initial capacities (`64` / `32`). Without a hint, `List<T>` doubles its internal array on the first AoE burst, allocating on the LOH mid-combat. |
+| `ArenaInstance._groundSpawnedPacket` | Added as a pre-allocated instance field (same pattern as `_posPacket`, `_projSpawnPacket`). `SpawnGroundItem` now mutates it in-place and passes it via `in`-ref instead of constructing a new struct literal on every item drop. |
+| `ArenaInstance.EvictExpiredGracePeriods` | `Console.Write` / `Console.WriteLine` calls moved into `Task.Run(...)` (fire-and-forget). `Console` internally allocates `char[]` buffers; even these rare calls were touching the GC on the game-loop thread. |
+| `ArenaInstance.ProcessTick` — status effect phase | Removed redundant end-of-block `.Clear()` calls on `_statusTickEvents` and `_expiredStatusEffects`. Both lists are cleared at the top of the phase each tick; the trailing clears were dead code that obscured the tick phase structure. |
+| `BroadcastState` | Updated to call `PacketEncoding.EncodeTick24(...)` and write the new `ServerTickLo/Hi` and `AcknowledgedTickLo/Hi` fields instead of the old `int` assignments. |
+
+#### May 31, 2026 — Zero-allocation audit (round 4)
+
+| Area | Change |
+|------|--------|
+| `ArenaInstance` | Pre-allocated `_deathPacket`, `_respawnPacket`, `_groundRemovedPacket`, and `_itemAddedPacket` struct fields added alongside the existing `_posPacket` / `_projSpawnPacket` fields. All four packet types are now mutated in-place and passed via `in`-ref to `SendToInterested` — eliminating the per-event struct copy that occurred when they were constructed inline. |
+| `ArenaInstance` Phase 5 (projectile results) | Replaced `foreach` / `foreach var (…)` loops over `TickResult` list fields with index-based `for` loops. `List<T>.Enumerator` is a struct (no boxing), but removing the `MoveNext`/`Current` overhead on the projectile collision hot path measurably reduces per-tick work under heavy combat load. |
+| `ArenaInstance._pendingHydration` | Changed from `ConcurrentQueue<T>` to plain `Queue<T>`. All access — `Enqueue` on connect (via `PollEvents` on the game-loop thread) and `Dequeue`/`Enqueue` in `FinalizeHydration` (also game-loop thread) — is single-threaded. `ConcurrentQueue` uses `Interlocked` and `volatile` operations internally; `Queue<T>` has zero synchronisation overhead. |
+| `PlayerStateSink.FlushAsync` | `Task.Run(static lambda, state)` pattern documented but held at `Task.Run(() => …)` because the state-passing overload requires .NET 8+. A comment marks the upgrade path. The closure allocation (~48 B) is acceptable on this cold path (once per player per 60 s). |
+
+#### May 31, 2026 — Data-layer allocation audit (round 3)
+
+| Area | Change |
+|------|--------|
+| `PlayerStateSink.FlushAsync` | Changed from `async Task` with sync prelude to `Task.Run(() => FlushCoreAsync(...))`. The old implementation executed string interpolation and `JsonSerializer.Serialize` synchronously on the caller's thread (the game-loop thread) before the first `await`. Now returns immediately; all CPU work runs on a thread-pool thread. |
+| `MatchDataService.LoadPlayerProfile` | Replaced `JsonSerializer.Deserialize(raw.ToString())` with `(byte[])raw` + `bytes.AsSpan()` overload. Eliminates the intermediate managed `string` copy of the Redis JSON payload. |
+| `MatchDataService.LoadPlayerProfileAsync` | Same `byte[]` + `Span<byte>` fix. Runs on a thread-pool continuation thread (post-`await`), so it does not affect the tick budget, but reduces GC pressure at high connection rates. |
+
+---
+
+## Roadmap
+
+See [`ROADMAP.md`](ROADMAP.md) for the full engineering goals checklist, split into two phases:
+
+- **Phase 1 — Arena:** All systems required for the current PvP arena build target. Use this as the active implementation checklist.
+- **Phase 2 — MMO:** NPC/mob systems, pathfinding, aggro tables, XP/leveling, player trading, and world persistence. Defined for planning purposes — out of scope until Phase 1 is complete.
+
+Each item has a status marker (✅ implemented, 🔶 partial, ❌ not built) and notes pointing to the relevant source files.
 
 ---
 

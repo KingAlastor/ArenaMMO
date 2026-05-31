@@ -1,6 +1,6 @@
 using LiteNetLib;
 using System;
-using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Threading;
 
 namespace GameServer
@@ -81,7 +81,13 @@ namespace GameServer
             }
         }
 
-        private readonly ConcurrentDictionary<NetPeer, PeerGuardState> _peerGuards = new();
+        // All IntentGuard entry points (TryAcceptIntent, TryReserveActionSlot, ReleaseActionSlot,
+        // OnPeerConnected, OnPeerDisconnected) are called from ArenaInstance which runs them
+        // entirely on the game-loop thread via PollEvents() and ProcessTick().
+        // A plain Dictionary eliminates the interlocked overhead of ConcurrentDictionary and,
+        // critically, avoids the heap-allocated boxed IEnumerator that ConcurrentDictionary's
+        // foreach produces (Dictionary.Enumerator is a public value-type struct).
+        private readonly Dictionary<NetPeer, PeerGuardState> _peerGuards = new();
         private int _attackQueueDepth;
         private int _spellQueueDepth;
         private int _shootQueueDepth;
@@ -90,7 +96,7 @@ namespace GameServer
             => _peerGuards[peer] = new PeerGuardState(Environment.TickCount64);
 
         public void OnPeerDisconnected(NetPeer peer)
-            => _peerGuards.TryRemove(peer, out _);
+            => _peerGuards.Remove(peer);
 
         public bool TryAcceptIntent(
             NetPeer peer,
@@ -104,7 +110,11 @@ namespace GameServer
             if (!isKnownPeer)
                 return false;
 
-            PeerGuardState guard = _peerGuards.GetOrAdd(peer, _ => new PeerGuardState(Environment.TickCount64));
+            if (!_peerGuards.TryGetValue(peer, out PeerGuardState? guard))
+            {
+                guard = new PeerGuardState(Environment.TickCount64);
+                _peerGuards[peer] = guard;
+            }
             bool disconnect = false;
 
             lock (guard.Gate)
@@ -168,7 +178,12 @@ namespace GameServer
         Finalize:
             if (disconnect)
             {
-                Console.WriteLine($"[Guard] Disconnecting peer {peer.Id} for intent abuse");
+                // Console.WriteLine allocates a string — fire off the game-loop thread.
+                // ThreadPool.QueueUserWorkItem<T> with a static lambda avoids a closure object.
+                int peerId = peer.Id;
+                ThreadPool.QueueUserWorkItem(
+                    static id => Console.WriteLine($"[Guard] Disconnecting peer {id} for intent abuse"),
+                    peerId, preferLocal: false);
                 peer.Disconnect();
             }
 
@@ -193,7 +208,10 @@ namespace GameServer
 
             if (disconnect)
             {
-                Console.WriteLine($"[Guard] Disconnecting peer {peer.Id} for queue abuse");
+                int peerId = peer.Id;
+                ThreadPool.QueueUserWorkItem(
+                    static id => Console.WriteLine($"[Guard] Disconnecting peer {id} for queue abuse"),
+                    peerId, preferLocal: false);
                 peer.Disconnect();
                 return false;
             }
@@ -214,7 +232,10 @@ namespace GameServer
 
             if (disconnect)
             {
-                Console.WriteLine($"[Guard] Disconnecting peer {peer.Id} for global queue abuse");
+                int peerId = peer.Id;
+                ThreadPool.QueueUserWorkItem(
+                    static id => Console.WriteLine($"[Guard] Disconnecting peer {id} for global queue abuse"),
+                    peerId, preferLocal: false);
                 peer.Disconnect();
             }
 

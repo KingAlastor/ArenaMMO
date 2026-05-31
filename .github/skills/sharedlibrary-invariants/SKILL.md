@@ -30,6 +30,11 @@ This skill defines protocol and shared-combat invariants Copilot must preserve w
 - Do not remove action sequence fields from action intent packets; replay resistance depends on them.
 - Do not revert `PlayerInputPacket.InputX`/`InputY` from `sbyte` back to `float`; this would reintroduce cross-platform FP normalization divergence between Unity and .NET runtimes.
 - Do not remove `EntityPositionPacket.ServerTick` or `AcknowledgedTick`; the Unity client depends on these for prediction reconciliation.
+- Do not add raw `float` X/Y position fields to new hot-path struct packets; use `short` fixed-point via `PacketEncoding.EncodePosition`.
+- Do not add raw `float` direction fields to new hot-path struct packets; use `short×32767` via `PacketEncoding.EncodeDirection`.
+- Do not add raw `float` speed or range fields to new hot-path struct packets; use `ushort×10` via `PacketEncoding.EncodeSpeed`.
+- Do not convert `StatusEffectAppliedPacket`, `StatusEffectRemovedPacket`, `ProjectileSpawnPacket`, or `ProjectileDestroyPacket` back to classes; they are now zero-allocation structs used in hot paths.
+- Do not add a `Stacks` field back to `StatusEffectAppliedPacket`; stacks are server-internal state on `ActiveStatusEffect`, not broadcast over the wire.
 
 ## Compatibility Target
 - SharedLibrary targets .NET Standard 2.1.
@@ -61,25 +66,26 @@ Packets are grouped by direction and purpose.
 - `GroundItemPickupRequestPacket` — client requests pickup of a specific ground item. Fields: `int GroundItemId`. Server validates ownership, distance, and inventory space.
 
 ### Server → Client (authoritative state)
-- `EntityPositionPacket` — authoritative position + `ServerTick` + `AcknowledgedTick` for reconciliation.
-- `EntityHealthPacket` — faction-gated health update (allies only).
-- `EntitySpawnPacket` — broadcast when a player successfully authenticates and enters the arena. Fields: `EntityId`, `PlayerName`, `Faction`, `X`, `Y`.
-- `EntityDespawnPacket` — broadcast when a player disconnects. Fields: `EntityId`.
-- `CombatEventPacket` — single-target hit event (melee or single-target spell). Fields: `AttackerId`, `TargetId`, `Damage`, `IsCritical`.
-- `AoEHitEventPacket` — one packet per entity hit by an AoE or MeleeSplash spell. Fields: `CasterId`, `SpellId`, `HitEntityId`, `Damage`, `IsCritical`. **Note:** the hit-target field is `HitEntityId` — there is no `TargetId` field on this packet. Do not reference `TargetId` here; that causes compile errors.
-- `ProjectileSpawnPacket` — authoritative projectile creation event.
-- `ProjectileDestroyPacket` — projectile removal event (hit or expiry).
-- `StatusEffectAppliedPacket` — visibility-filtered status effect application.
-- `StatusEffectRemovedPacket` — visibility-filtered status effect expiry.
-- `PlayerDeathPacket` — broadcast on kill. Fields: `KilledEntityId`, `KillerEntityId`.
-- `PlayerRespawnPacket` — broadcast when a player re-enters play after respawn timer. Fields: `EntityId`, `X`, `Y`, `Health`.
-- `MatchEndPacket` — broadcast once when win condition is met. Fields: `WinnerFaction` (byte).
-- `GroundItemSpawnedPacket` — sent to interested viewers when a ground item appears. Fields: `int GroundItemId, int DefinitionId, float X, float Y`.
-- `GroundItemRemovedPacket` — sent to interested viewers when a ground item is picked up or despawned. Fields: `int GroundItemId`.
-- `ItemAddedToInventoryPacket` — sent only to the owning client when an item enters their inventory. Fields: `int InstanceId, int DefinitionId`.
-- `PlayerGraceDisconnectPacket` — sent to all peers when a player loses connection but enters the grace-period. Fields: `int EntityId`. Clients show a disconnected indicator; the ghost entity remains in world.
-- `PlayerReconnectedPacket` — sent to all peers when a grace-period player successfully rejoins. Fields: `int EntityId`.
-- `CraftingRewardPacket` — sent to the owning client at Arena match end to notify earned crafting ingredients. Fields: `string RewardsCsv` (format `"id:qty,id:qty,..."`). Parsing and crediting happen in ProfileServer via the Redis `crafting-reward:{accountId}` key.
+- `EntityPositionPacket` — authoritative position + `ServerTick` + `AcknowledgedTick` for reconciliation. **struct**. Wire size **17 B** (`PacketId` byte + `EntityId` int + `X`/`Y` short fixed-point + `ServerTick` int + `AcknowledgedTick` int = 1+4+2+2+4+4). The old "14 B" figure assumed a 3-byte tick encoding that is not implemented; 17 B is the correct on-wire size.
+- `EntityHealthPacket` — faction-gated health update (allies only). **struct**.
+- `EntitySpawnPacket` — broadcast when a player successfully authenticates and enters the arena. Fields: `EntityId`, `PlayerName`, `Faction`, `X`, `Y`. **class** (carries `string`).
+- `EntityDespawnPacket` — broadcast when a player disconnects. Fields: `EntityId`. **struct**.
+- `CombatEventPacket` — single-target hit event (melee or single-target spell). Fields: `AttackerId`, `TargetId`, `Damage`, `IsCritical`. **struct**.
+- `AoEHitEventPacket` — one packet per entity hit by an AoE or MeleeSplash spell. Fields: `CasterId`, `SpellId`, `HitEntityId`, `Damage`, `IsCritical`. **struct**. **Note:** the hit-target field is `HitEntityId` — there is no `TargetId` field on this packet. Do not reference `TargetId` here; that causes compile errors.
+- `ProjectileSpawnPacket` — authoritative projectile creation event. **struct**. Wire size 25 B. Fields: `ProjectileId`, `OwnerId`, `SpellId`, `StartX`/`StartY` (short fixed-point), `DirectionX`/`DirectionY` (short×32767), `Speed`/`MaxRange` (ushort×10). Use `PacketEncoding.EncodeDirection`/`DecodeDirection` and `PacketEncoding.EncodeSpeed`/`DecodeSpeed`.
+- `ProjectileDestroyPacket` — projectile removal event (hit or expiry). **struct**. Wire size 6 B. `HitSomething` packed into `byte Flags` bit 0.
+- `StatusEffectAppliedPacket` — visibility-filtered status effect application. **struct**. Wire size 15 B. `Visibility` packed into `byte VisibilityFlags` bit 0. `RemainingTicks` is `short`.
+- `StatusEffectRemovedPacket` — visibility-filtered status effect expiry. **struct**. Wire size 10 B. Same visibility packing.
+- `PlayerDeathPacket` — broadcast on kill. Fields: `KilledEntityId`, `KillerEntityId`. **struct**.
+- `PlayerRespawnPacket` — broadcast when a player re-enters play after respawn timer. Fields: `EntityId`, `X`, `Y` (short fixed-point), `Health` (ushort). **struct**.
+- `MatchEndPacket` — broadcast once when win condition is met. Fields: `WinnerFaction` (byte). **struct**.
+- `GroundItemSpawnedPacket` — sent to interested viewers when a ground item appears. Fields: `GroundItemId`, `DefinitionId`, `X`/`Y` (short fixed-point). **struct**.
+- `GroundItemRemovedPacket` — sent to interested viewers when a ground item is picked up or despawned. Fields: `GroundItemId`. **struct**.
+- `ItemAddedToInventoryPacket` — sent only to the owning client when an item enters their inventory. Fields: `InstanceId`, `DefinitionId`. **struct**.
+- `PlayerGraceDisconnectPacket` — sent to all peers when a player loses connection but enters the grace-period. Fields: `EntityId`. **struct**. Clients show a disconnected indicator; the ghost entity remains in world.
+- `PlayerReconnectedPacket` — sent to all peers when a grace-period player successfully rejoins. Fields: `EntityId`. **struct**.
+- `PlayerStatsRefreshedPacket` — sent only to the owning client after gear swap / equip / stat-buff expiry. **struct**. Wire size 20 B. Stat fractions as `ushort×10000`.
+- `CraftingRewardPacket` — sent to the owning client at Arena match end to notify earned crafting ingredients. Fields: `string RewardsCsv` (format `"id:qty,id:qty,..."`). **class** (carries `string`). Parsing and crediting happen in ProfileServer via the Redis `crafting-reward:{accountId}` key.
 
 ### Packet Design Rules
 - Do not add client-authoritative semantics to any packet contract.
@@ -140,7 +146,26 @@ Do not move authoritative validation into SharedLibrary data alone; data describ
 - For new mechanics, include enough parameters for server-side enforcement.
 - For faction-sensitive behavior, include explicit targeting/visibility fields when needed.
 
+## PacketEncoding Helpers
+All helpers are in `SharedLibrary.PacketEncoding` and used by both server and Unity client:
+
+| Helper pair | Type | Scale | Precision | Range |
+|-------------|------|-------|-----------|-------|
+| `EncodePosition` / `DecodePosition` | `float ↔ short` | ×16 | 0.0625 units | ±2048 units |
+| `EncodeHealth` / `DecodeHealth` | `float ↔ ushort` | integer HP | 1 HP | 0–65535 |
+| `EncodeStat` / `DecodeStat` | `float ↔ ushort` | ×10000 | 0.0001 | 0–6.5535 |
+| `EncodeAttackPower` / `DecodeAttackPower` | `float ↔ ushort` | ×100 | 0.01 | 0–655.35 |
+| `EncodeDirection` / `DecodeDirection` | `float ↔ short` | ×32767 | ~0.00003 | −1..1 (unit vectors) |
+| `EncodeSpeed` / `DecodeSpeed` | `float ↔ ushort` | ×10 | 0.1 units(/s) | 0–6553.5 |
+
+Do not add raw `float` position, direction, or speed fields to new hot-path struct packets. Use the appropriate encoding pair.
+
 ## Shared Value Types
+
+### `Vec2` (`struct`)
+- Fields: `float X, Y`.
+- Carries `[StructLayout(Sequential, Pack=1)]` for guaranteed cross-platform blittability.
+- Do not add managed references (classes) to `Vec2`; it must remain blittable.
 
 ### `WorldBounds` (`readonly struct`)
 - Fields: `float MinX, MaxX, MinY, MaxY`.

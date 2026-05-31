@@ -38,6 +38,8 @@ namespace SharedLibrary
     // ── Value Types ───────────────────────────────────────────────────────────
 
     /// <summary>Zero-allocation 2D position/vector used throughout all position math.</summary>
+    [System.Runtime.InteropServices.StructLayout(
+        System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 1)]
     public struct Vec2
     {
         public float X;
@@ -48,6 +50,391 @@ namespace SharedLibrary
         /// <summary>Convenience constant — equivalent to default(Vec2).</summary>
         public static readonly Vec2 Zero = new Vec2(0f, 0f);
     }
+
+    // ── Packet Compression Helpers ────────────────────────────────────────────
+    //
+    // Fixed-point position encoding:
+    //   World coordinates are assumed to fit within ±2048 units (max MMORPG zone size).
+    //   Multiplying by PositionScale (16) gives a range of ±32768, exactly fitting a short.
+    //   Precision = 1/16 = 0.0625 world units — sufficient for collision and rendering.
+    //   Savings: 4 bytes (float) → 2 bytes (short) per axis → 4 bytes saved per position.
+    //
+    // Health encoding:
+    //   ushort stores 0–65535 as raw integer HP, eliminating the float representation.
+    //   Savings: 4 bytes (float) → 2 bytes (ushort).
+    //
+    // CombatEvent flags byte:
+    //   Bit 0 = IsCritical.  Upper bits reserved for DamageType and future flags.
+    //   Savings: bool (4 bytes aligned) → packed into existing flags byte.
+    //
+    public static partial class PacketEncoding
+    {
+        public const float PositionScale    = 16f;
+        public const float InvPositionScale = 1f / PositionScale;
+
+        /// <summary>Encodes a world-space float coordinate as a fixed-point short.</summary>
+        public static short EncodePosition(float v)
+            => (short)(int)(v * PositionScale);
+
+        /// <summary>Decodes a fixed-point short back to a world-space float.</summary>
+        public static float DecodePosition(short v)
+            => v * InvPositionScale;
+
+        /// <summary>Encodes HP as a raw ushort (0–65535 integer HP).</summary>
+        public static ushort EncodeHealth(float hp)
+            => (ushort)System.Math.Clamp((int)hp, 0, 65535);
+
+        /// <summary>Decodes HP from ushort back to float.</summary>
+        public static float DecodeHealth(ushort hp)
+            => hp;
+
+        // ── 24-bit tick encoding ─────────────────────────────────────────────────────────────
+        //
+        // Replaces the two int fields (ServerTick, AcknowledgedTick) in EntityPositionPacket
+        // with a 3-byte layout: ushort (low 16 bits) + byte (high 8 bits).
+        //
+        // Capacity: 2^24 = 16,777,216 ticks ≈ 154 hours at 30 Hz — safe for any session length.
+        // Wire savings: 2 × (4−3) = 2 bytes per EntityPositionPacket.
+        //   At 30 Hz, 2,000 players, average 20 viewers each:
+        //   2,000 × 20 × 30 × 2 bytes = 2.4 MB/s bandwidth reduction.
+        //
+        // Client-side decode:
+        //   int tick = tickLo | (tickHi << 16);
+        //   To handle wrapping use: int tick = (lastKnownTick & ~0xFFFFFF) | raw;
+        //   and add 0x1000000 if the result drifts more than half the range behind lastKnownTick.
+        public static void EncodeTick24(int tick, out ushort lo, out byte hi)
+        {
+            uint u = (uint)tick & 0xFFFFFF;
+            lo = (ushort)(u & 0xFFFF);
+            hi = (byte)(u >> 16);
+        }
+
+        public static int DecodeTick24(ushort lo, byte hi)
+            => (int)((uint)lo | ((uint)hi << 16));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // HOT-PATH STRUCTS  (sent every tick or on every combat event)
+    // All are [StructLayout(Sequential, Pack=1)] blittable value types.
+    // Written directly to NetDataWriter to bypass reflection-based serialisation.
+    // Each struct begins with a 1-byte PacketId so the receiver can dispatch.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    public static class PacketId
+    {
+        // ── Per-tick broadcast (highest volume) ──────────────────────────────
+        public const byte EntityPosition         = 1;
+        public const byte EntityHealth           = 2;
+        public const byte CombatEvent            = 3;
+        public const byte AoEHitEvent            = 4;
+        // ── Event structs (converted from classes to eliminate tick-loop GC) ─
+        public const byte EntityDespawn          = 5;
+        public const byte PlayerDeath            = 6;
+        public const byte PlayerRespawn          = 7;
+        public const byte MatchEnd               = 8;
+        public const byte GroundItemSpawned      = 9;
+        public const byte GroundItemRemoved      = 10;
+        public const byte ItemAddedToInventory   = 11;
+        public const byte PlayerGraceDisconnect  = 12;
+        public const byte PlayerReconnected      = 13;
+        public const byte PlayerStatsRefreshed   = 14;
+        // ── Projectile lifecycle (converted to structs — zero-alloc hot path) ─
+        public const byte ProjectileSpawn        = 15;
+        public const byte ProjectileDestroy      = 16;
+        // ── Status effect events (converted to structs — zero-alloc hot path) ─
+        public const byte StatusEffectApplied    = 17;
+        public const byte StatusEffectRemoved    = 18;
+    }
+
+    /// <summary>
+    /// Broadcast every tick with the authoritative position of one entity.
+    /// Wire size (Pack=1, Sequential): 1 (id) + 4 (entityId) + 2 (X) + 2 (Y)
+    ///                               + 3 (serverTick) + 3 (ackedTick) = 15 bytes.
+    /// Previous layout used two int fields = 17 bytes (+2 bytes per packet per entity).
+    ///
+    /// Tick fields use 24-bit wrapping encoding via PacketEncoding.EncodeTick24/DecodeTick24.
+    /// Wraps after 16,777,216 ticks ≈ 154 hours at 30 Hz — safe for all session types.
+    ///
+    /// Bandwidth saving vs. 4-byte int ticks:
+    ///   2,000 players × 20 viewers × 30 Hz × 2 bytes = 2.4 MB/s reduction.
+    /// </summary>
+    [System.Runtime.InteropServices.StructLayout(
+        System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 1)]
+    public struct EntityPositionPacket
+    {
+        public byte  PacketTypeId;          // always PacketId.EntityPosition
+        public int   EntityId;
+        public short X;                     // fixed-point, use PacketEncoding.DecodePosition
+        public short Y;
+        // ServerTick encoded as 24 bits: TickLo (low 16) + TickHi (high 8).
+        // Use PacketEncoding.EncodeTick24 / DecodeTick24.
+        public ushort ServerTickLo;
+        public byte   ServerTickHi;
+        public ushort AcknowledgedTickLo;
+        public byte   AcknowledgedTickHi;
+    }
+
+    /// <summary>
+    /// Broadcast only to clients allowed to see the entity's health (same faction).
+    /// Wire size: 1 + 4 + 2 = 7 bytes.  Old class: ~16 bytes.
+    /// </summary>
+    [System.Runtime.InteropServices.StructLayout(
+        System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 1)]
+    public struct EntityHealthPacket
+    {
+        public byte   PacketTypeId;     // always PacketId.EntityHealth
+        public int    EntityId;
+        public ushort Health;           // raw integer HP — use PacketEncoding.DecodeHealth
+    }
+
+    /// <summary>
+    /// Broadcast when a melee attack or single-target spell lands.
+    /// Wire size: 1 + 4 + 4 + 2 + 1 = 12 bytes  (was 13 with int Damage).
+    /// Damage is a ushort: max 65,535 raw damage per hit — sufficient for all game designs
+    /// that don't have arbitrarily scaling numbers. Clamp server-side before assignment.
+    /// Flags byte: bit 0 = IsCritical; bits 1-2 = DamageType; bits 3-7 reserved.
+    /// </summary>
+    [System.Runtime.InteropServices.StructLayout(
+        System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 1)]
+    public struct CombatEventPacket
+    {
+        public byte   PacketTypeId;     // always PacketId.CombatEvent
+        public int    AttackerId;
+        public int    TargetId;
+        /// <summary>Raw damage value, clamped to [0, 65535] server-side before assignment.</summary>
+        public ushort Damage;
+        /// <summary>Bit 0 = IsCritical. Bit 1-2 = DamageType.</summary>
+        public byte   Flags;
+
+        public bool IsCritical
+        {
+            get => (Flags & 0x01) != 0;
+            set => Flags = value ? (byte)(Flags | 0x01) : (byte)(Flags & ~0x01);
+        }
+    }
+
+    /// <summary>
+    /// Broadcast once per entity hit inside an AoE.
+    /// Wire size: 1 + 4 + 4 + 4 + 2 + 1 = 16 bytes (was 17 with int Damage).
+    /// Damage clamped to ushort [0, 65535] server-side, matching CombatEventPacket.
+    /// </summary>
+    [System.Runtime.InteropServices.StructLayout(
+        System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 1)]
+    public struct AoEHitEventPacket
+    {
+        public byte   PacketTypeId;     // always PacketId.AoEHitEvent
+        public int    CasterId;
+        public int    SpellId;
+        public int    HitEntityId;
+        public ushort Damage;           // clamped to [0, 65535]
+        public byte   Flags;            // bit 0 = IsCritical
+
+        public bool IsCritical
+        {
+            get => (Flags & 0x01) != 0;
+            set => Flags = value ? (byte)(Flags | 0x01) : (byte)(Flags & ~0x01);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // EVENT STRUCTS  (converted from classes to eliminate mid-tick GC)
+    //
+    // Why:  Even "rare" events (deaths, respawns, loot drops) allocate a heap
+    //       object every time they fire.  Under heavy MMORPG load — AoE wipes,
+    //       mass loot drops, zone transfers — this creates sustained GC pressure
+    //       inside ProcessTick().  Pre-allocating these as instance fields on
+    //       ArenaInstance and writing directly to NetDataWriter is zero-alloc.
+    //
+    // Wire-size gains (vs. managed class with object header ≈ 16-byte overhead):
+    //   EntityDespawnPacket        class ~16 B → struct 5 B   (−11 B)
+    //   PlayerDeathPacket          class ~24 B → struct 9 B   (−15 B)
+    //   PlayerRespawnPacket        class ~32 B → struct 11 B  (−21 B, X/Y/HP compressed)
+    //   MatchEndPacket             class ~17 B → struct 2 B   (−15 B)
+    //   GroundItemSpawnedPacket    class ~28 B → struct 13 B  (−15 B, X/Y compressed)
+    //   GroundItemRemovedPacket    class ~16 B → struct 5 B   (−11 B)
+    //   ItemAddedToInventoryPacket class ~24 B → struct 9 B   (−15 B)
+    //   PlayerGraceDisconnectPacket class ~16 B → struct 5 B  (−11 B)
+    //   PlayerReconnectedPacket    class ~16 B → struct 5 B   (−11 B)
+    //   PlayerStatsRefreshedPacket class ~48 B → struct 19 B  (−29 B, floats→ushort)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ── PacketEncoding helpers for new compressed fields ─────────────────────
+    public static partial class PacketEncoding
+    {
+        // Stat percentages (0.0–1.0) compressed to ushort ×10 000.
+        // Precision: 0.0001 (4 decimal places). Range: 0.0000–6.5535.
+        public const float StatScale = 10_000f;
+        public static ushort EncodeStat(float v)   => (ushort)System.Math.Clamp((int)(v * StatScale), 0, 65535);
+        public static float  DecodeStat(ushort v)  => v / StatScale;
+
+        // AttackPower compressed to ushort ×100. Range: 0–655.35.
+        public const float AttackPowerScale = 100f;
+        public static ushort EncodeAttackPower(float v) => (ushort)System.Math.Clamp((int)(v * AttackPowerScale), 0, 65535);
+        public static float  DecodeAttackPower(ushort v) => v / AttackPowerScale;
+
+        // Unit-vector component compressed to short×32767 (-1..1 → -32767..32767).
+        // Precision: 1/32767 ≈ 0.00003 — sufficient for projectile direction.
+        public const float DirectionScale    = 32767f;
+        public const float InvDirectionScale = 1f / DirectionScale;
+        public static short  EncodeDirection(float v)  => (short)(int)(v * DirectionScale);
+        public static float  DecodeDirection(short v)  => v * InvDirectionScale;
+
+        // Speed / range compressed to ushort×10.  Range: 0–6553.5 units (or units/s).
+        // Precision: 0.1 units — more than sufficient for projectile travel.
+        public const float SpeedScale    = 10f;
+        public const float InvSpeedScale = 1f / SpeedScale;
+        public static ushort EncodeSpeed(float v) => (ushort)System.Math.Clamp((int)(v * SpeedScale), 0, 65535);
+        public static float  DecodeSpeed(ushort v) => v * InvSpeedScale;
+    }
+
+    /// <summary>
+    /// Broadcast when the server permanently removes an entity.
+    /// Wire size: 1 + 4 = 5 bytes.
+    /// </summary>
+    [System.Runtime.InteropServices.StructLayout(
+        System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 1)]
+    public struct EntityDespawnPacket
+    {
+        public byte PacketTypeId;   // always PacketId.EntityDespawn
+        public int  EntityId;
+    }
+
+    /// <summary>
+    /// Broadcast when a player's health reaches zero.
+    /// KillerEntityId is 0 when the kill source is unknown.
+    /// Wire size: 1 + 4 + 4 = 9 bytes.
+    /// </summary>
+    [System.Runtime.InteropServices.StructLayout(
+        System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 1)]
+    public struct PlayerDeathPacket
+    {
+        public byte PacketTypeId;   // always PacketId.PlayerDeath
+        public int  KilledEntityId;
+        public int  KillerEntityId;
+    }
+
+    /// <summary>
+    /// Broadcast when a dead player's respawn timer expires.
+    /// X/Y: fixed-point shorts (PacketEncoding.EncodePosition).
+    /// Health: raw ushort integer HP (PacketEncoding.EncodeHealth).
+    /// Wire size: 1 + 4 + 2 + 2 + 2 = 11 bytes.
+    /// </summary>
+    [System.Runtime.InteropServices.StructLayout(
+        System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 1)]
+    public struct PlayerRespawnPacket
+    {
+        public byte   PacketTypeId;   // always PacketId.PlayerRespawn
+        public int    EntityId;
+        public short  X;              // fixed-point, use PacketEncoding.DecodePosition
+        public short  Y;
+        public ushort Health;         // raw integer HP, use PacketEncoding.DecodeHealth
+    }
+
+    /// <summary>
+    /// Sent only to the owning client after a gear swap/equip.
+    /// Percentage fields use ushort ×10 000 fixed-point (0.0001 precision).
+    /// AttackPower uses ushort ×100 fixed-point (0.01 precision, max 655.35).
+    /// MaxHealth uses ushort integer HP (same as EntityHealthPacket).
+    /// Wire size: 1 + 1 + 2 + 2 + 2 + 2 + 2 + 2 + 2 + 2 + 2 = 20 bytes (vs. 48+ as a class).
+    /// </summary>
+    [System.Runtime.InteropServices.StructLayout(
+        System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 1)]
+    public struct PlayerStatsRefreshedPacket
+    {
+        public byte   PacketTypeId;           // always PacketId.PlayerStatsRefreshed
+        public byte   ActiveGearSetIndex;
+        public ushort MaxHealth;              // integer HP
+        public ushort AttackPower;            // ×100 fixed-point
+        public ushort PhysicalAbsorbPercent;  // ×10 000 fixed-point
+        public ushort PhysicalResistPercent;
+        public ushort MagicAbsorbPercent;
+        public ushort MagicResistPercent;
+        public ushort CritChance;
+        public ushort MeleeLifeStealPercent;
+    }
+
+    /// <summary>
+    /// Broadcast once when the win condition is satisfied.
+    /// Wire size: 1 + 1 = 2 bytes.
+    /// </summary>
+    [System.Runtime.InteropServices.StructLayout(
+        System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 1)]
+    public struct MatchEndPacket
+    {
+        public byte PacketTypeId;   // always PacketId.MatchEnd
+        public byte WinnerFaction;  // maps to FactionId
+    }
+
+    /// <summary>
+    /// Broadcast when a lootable item appears on the ground.
+    /// X/Y: fixed-point shorts (PacketEncoding.EncodePosition).
+    /// Wire size: 1 + 4 + 4 + 2 + 2 = 13 bytes.
+    /// </summary>
+    [System.Runtime.InteropServices.StructLayout(
+        System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 1)]
+    public struct GroundItemSpawnedPacket
+    {
+        public byte  PacketTypeId;   // always PacketId.GroundItemSpawned
+        public int   GroundItemId;
+        public int   DefinitionId;
+        public short X;              // fixed-point, use PacketEncoding.DecodePosition
+        public short Y;
+    }
+
+    /// <summary>
+    /// Broadcast when a ground item is picked up or despawned.
+    /// Wire size: 1 + 4 = 5 bytes.
+    /// </summary>
+    [System.Runtime.InteropServices.StructLayout(
+        System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 1)]
+    public struct GroundItemRemovedPacket
+    {
+        public byte PacketTypeId;   // always PacketId.GroundItemRemoved
+        public int  GroundItemId;
+    }
+
+    /// <summary>
+    /// Confirms to the owning client that an item was added to their inventory.
+    /// Wire size: 1 + 4 + 4 = 9 bytes.
+    /// </summary>
+    [System.Runtime.InteropServices.StructLayout(
+        System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 1)]
+    public struct ItemAddedToInventoryPacket
+    {
+        public byte PacketTypeId;   // always PacketId.ItemAddedToInventory
+        public int  DefinitionId;
+        public int  InstanceId;
+    }
+
+    /// <summary>
+    /// Broadcast when a player's connection drops but their session is preserved.
+    /// Wire size: 1 + 4 = 5 bytes.
+    /// </summary>
+    [System.Runtime.InteropServices.StructLayout(
+        System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 1)]
+    public struct PlayerGraceDisconnectPacket
+    {
+        public byte PacketTypeId;   // always PacketId.PlayerGraceDisconnect
+        public int  EntityId;
+    }
+
+    /// <summary>
+    /// Broadcast when a grace-period player successfully reconnects.
+    /// Wire size: 1 + 4 = 5 bytes.
+    /// </summary>
+    [System.Runtime.InteropServices.StructLayout(
+        System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 1)]
+    public struct PlayerReconnectedPacket
+    {
+        public byte PacketTypeId;   // always PacketId.PlayerReconnected
+        public int  EntityId;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // INFREQUENT CLASS PACKETS  (C→S input or low-frequency S→C with strings)
+    // These retain NetPacketProcessor compat because they carry string fields
+    // or are only sent during auth/lobby handshake — never inside ProcessTick.
+    // ─────────────────────────────────────────────────────────────────────────
 
     // ── Client → Server Packets ───────────────────────────────────────────────
 
@@ -130,72 +517,60 @@ namespace SharedLibrary
         public string Signature      { get; set; } = string.Empty;
     }
 
-    // ── Server → Client Packets ───────────────────────────────────────────────
-
-    /// <summary>Broadcast every tick with the authoritative position of one entity.</summary>
-    public class EntityPositionPacket
-    {
-        public int   EntityId         { get; set; }
-        public float X                { get; set; }
-        public float Y                { get; set; }
-        /// <summary>The server tick that produced this snapshot. Used by the client to replay buffered inputs during reconciliation.</summary>
-        public int   ServerTick       { get; set; }
-        /// <summary>The last client TickNumber the server consumed for this entity. The client discards buffered inputs older than this before replaying.</summary>
-        public int   AcknowledgedTick { get; set; }
-    }
-
-    /// <summary>Broadcast only to clients that are allowed to see the entity's health.</summary>
-    public class EntityHealthPacket
-    {
-        public int   EntityId { get; set; }
-        public float Health   { get; set; }
-    }
-
-    /// <summary>Broadcast when a melee attack or single-target spell lands.</summary>
-    public class CombatEventPacket
-    {
-        public int  AttackerId { get; set; }
-        public int  TargetId   { get; set; }
-        public int  Damage     { get; set; }
-        public bool IsCritical { get; set; }
-    }
-
-    /// <summary>
-    /// Broadcast once per entity hit inside an AoE.
-    /// The client correlates multiple packets by CasterId + SpellId to play
-    /// one VFX while applying damage to each unique HitEntityId.
-    /// </summary>
-    public class AoEHitEventPacket
-    {
-        public int  CasterId    { get; set; }
-        public int  SpellId     { get; set; }
-        public int  HitEntityId { get; set; }
-        public int  Damage      { get; set; }
-        public bool IsCritical  { get; set; }
-    }
+    // ── Status Effect Packets (converted from classes to zero-alloc structs) ──
+    //
+    // Why: TryApplyStatusEffect fires on every weapon hit, spell hit, and projectile hit.
+    // Under a 20-player AoE fight this means ~60 status-effect allocations per tick.
+    // Converting to structs + passing by `out` eliminates all of them.
+    //
+    // Visibility is packed into the low bit of VisibilityFlags alongside reserved bits.
+    // Wire size: StatusEffectAppliedPacket  class ~40 B → struct 15 B  (−25 B)
+    //            StatusEffectRemovedPacket  class ~24 B → struct 10 B  (−14 B)
 
     /// <summary>
     /// Broadcast when a status effect is applied or refreshed on a target.
-    /// The server filters delivery based on StatusEffectVisibility.
+    /// Wire size: 1 (id) + 4 + 4 + 4 + 1 + 1 = 15 bytes.
+    /// Visibility bit: bit 0 of VisibilityFlags (0 = AlliesOnly, 1 = Everyone).
     /// </summary>
-    public class StatusEffectAppliedPacket
+    [System.Runtime.InteropServices.StructLayout(
+        System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 1)]
+    public struct StatusEffectAppliedPacket
     {
-        public int                    TargetEntityId { get; set; }
-        public int                    SourceEntityId { get; set; }
-        public int                    EffectId       { get; set; }
-        public int                    RemainingTicks { get; set; }
-        public int                    Stacks         { get; set; }
-        public StatusEffectVisibility Visibility     { get; set; }
+        public byte PacketTypeId;   // always PacketId.StatusEffectApplied
+        public int  TargetEntityId;
+        public int  SourceEntityId;
+        public int  EffectId;
+        /// <summary>Remaining duration in simulation ticks.</summary>
+        public short RemainingTicks;
+        /// <summary>bit 0 = Visibility (0=AlliesOnly, 1=Everyone); bits 1-7 reserved.</summary>
+        public byte VisibilityFlags;
+
+        public StatusEffectVisibility Visibility
+        {
+            get => (StatusEffectVisibility)(VisibilityFlags & 0x01);
+            set => VisibilityFlags = (byte)((VisibilityFlags & ~0x01) | ((byte)value & 0x01));
+        }
     }
 
     /// <summary>
-    /// Broadcast when a status effect expires or is removed.
+    /// Broadcast when a status effect expires or is forcibly removed.
+    /// Wire size: 1 + 4 + 4 + 1 = 10 bytes.
     /// </summary>
-    public class StatusEffectRemovedPacket
+    [System.Runtime.InteropServices.StructLayout(
+        System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 1)]
+    public struct StatusEffectRemovedPacket
     {
-        public int                    TargetEntityId { get; set; }
-        public int                    EffectId       { get; set; }
-        public StatusEffectVisibility Visibility     { get; set; }
+        public byte PacketTypeId;   // always PacketId.StatusEffectRemoved
+        public int  TargetEntityId;
+        public int  EffectId;
+        /// <summary>bit 0 = Visibility (0=AlliesOnly, 1=Everyone); bits 1-7 reserved.</summary>
+        public byte VisibilityFlags;
+
+        public StatusEffectVisibility Visibility
+        {
+            get => (StatusEffectVisibility)(VisibilityFlags & 0x01);
+            set => VisibilityFlags = (byte)((VisibilityFlags & ~0x01) | ((byte)value & 0x01));
+        }
     }
 
     // ── Projectile Packets ────────────────────────────────────────────────────
@@ -217,33 +592,51 @@ namespace SharedLibrary
     /// <summary>
     /// Broadcast when the server spawns a projectile so Unity can render it
     /// and interpolate its visual position independently of server ticks.
+    ///
+    /// Compression:
+    ///   StartX/Y   : fixed-point short  (PacketEncoding.EncodePosition, ±2048 @ 0.0625 precision)
+    ///   DirectionX/Y: short×32767       (PacketEncoding.EncodeDirection, unit vector -1..1)
+    ///   Speed       : ushort×10         (PacketEncoding.EncodeSpeed,     0–6553.5 units/s)
+    ///   MaxRange    : ushort×10         (PacketEncoding.EncodeSpeed,     0–6553.5 units)
+    /// Wire size: 1 + 4 + 4 + 4 + 2 + 2 + 2 + 2 + 2 + 2 = 25 bytes (class was ~60 B).
     /// </summary>
-    public class ProjectileSpawnPacket
+    [System.Runtime.InteropServices.StructLayout(
+        System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 1)]
+    public struct ProjectileSpawnPacket
     {
-        public int   ProjectileId { get; set; }
-        public int   OwnerId      { get; set; }
-        public int   SpellId      { get; set; }
-        public float StartX       { get; set; }
-        public float StartY       { get; set; }
-        public float DirectionX   { get; set; }
-        public float DirectionY   { get; set; }
-        public float Speed        { get; set; }
-        /// <summary>
-        /// Authoritative maximum travel distance. Unity uses this to despawn the visual
-        /// client-side and can also drive a range-indicator or crosshair-fade effect.
-        /// </summary>
-        public float MaxRange     { get; set; }
+        public byte   PacketTypeId;  // always PacketId.ProjectileSpawn
+        public int    ProjectileId;
+        public int    OwnerId;
+        public int    SpellId;
+        public short  StartX;        // fixed-point, use PacketEncoding.DecodePosition
+        public short  StartY;
+        public short  DirectionX;    // ×32767, use PacketEncoding.DecodeDirection
+        public short  DirectionY;
+        public ushort Speed;         // ×10, use PacketEncoding.DecodeSpeed
+        /// <summary>Authoritative max travel distance. Unity despawns the visual on reaching this.</summary>
+        public ushort MaxRange;      // ×10, use PacketEncoding.DecodeSpeed
     }
 
     /// <summary>
     /// Broadcast when the server removes a projectile — either because it hit
     /// a target (HitSomething = true, a CombatEventPacket is also sent) or
     /// because it exceeded its maximum travel range (HitSomething = false).
+    /// Wire size: 1 + 4 + 1 = 6 bytes (class was ~24 B).
+    /// Flags byte: bit 0 = HitSomething; bits 1-7 reserved.
     /// </summary>
-    public class ProjectileDestroyPacket
+    [System.Runtime.InteropServices.StructLayout(
+        System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 1)]
+    public struct ProjectileDestroyPacket
     {
-        public int  ProjectileId { get; set; }
-        public bool HitSomething { get; set; }
+        public byte PacketTypeId;   // always PacketId.ProjectileDestroy
+        public int  ProjectileId;
+        public byte Flags;          // bit 0 = HitSomething
+
+        public bool HitSomething
+        {
+            get => (Flags & 0x01) != 0;
+            set => Flags = value ? (byte)(Flags | 0x01) : (byte)(Flags & ~0x01);
+        }
     }
 
     // ── Entity lifecycle packets ───────────────────────────────────────────────────────
@@ -262,140 +655,16 @@ namespace SharedLibrary
         public float  Y          { get; set; }
     }
 
-    /// <summary>
-    /// Sent to all peers when a player leaves the match permanently (disconnect).
-    /// The client must destroy the entity for EntityId on receipt.
-    /// </summary>
-    public class EntityDespawnPacket
-    {
-        public int EntityId { get; set; }
-    }
-
-    // ── Match flow packets ─────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Broadcast when a player's health reaches zero.
-    /// The client plays a death animation and suppresses movement input for the entity.
-    /// KillerEntityId is 0 when the kill source cannot be attributed.
-    /// </summary>
-    public class PlayerDeathPacket
-    {
-        public int KilledEntityId { get; set; }
-        public int KillerEntityId { get; set; }
-    }
-
-    /// <summary>
-    /// Broadcast when a dead player's respawn timer expires and they re-enter play.
-    /// The client repositions and plays a spawn animation.
-    /// </summary>
-    public class PlayerRespawnPacket
-    {
-        public int   EntityId { get; set; }
-        public float X        { get; set; }
-        public float Y        { get; set; }
-        public float Health   { get; set; }
-    }
-
-    /// <summary>
-    /// Sent only to the owning client after the server applies a gear set swap.
-    /// Carries the full authoritative stat snapshot so the client can update its HUD and
-    /// character sheet without needing to re-request stats.
-    /// </summary>
-    public class PlayerStatsRefreshedPacket
-    {
-        public byte  ActiveGearSetIndex    { get; set; }
-        public float MaxHealth             { get; set; }
-        public float AttackPower           { get; set; }
-        public float PhysicalAbsorbPercent { get; set; }
-        public float PhysicalResistPercent { get; set; }
-        public float MagicAbsorbPercent    { get; set; }
-        public float MagicResistPercent    { get; set; }
-        public float CritChance            { get; set; }
-        public float MeleeLifeStealPercent { get; set; }
-    }
-
-    /// <summary>
-    /// Broadcast once when the win condition is satisfied. WinnerFaction maps to FactionId.
-    /// The server shuts down after sending this packet.
-    /// </summary>
-    public class MatchEndPacket
-    {
-        public byte WinnerFaction { get; set; }
-    }
-
-    // ── Ground-item Packets ───────────────────────────────────────────────────
-
+    // ── Ground-item C→S request — remains a class (NetPacketProcessor compat) ─
     /// <summary>Client → Server: player wants to pick up a ground item by its server-assigned ID.</summary>
     public class GroundItemPickupRequestPacket
     {
         public int GroundItemId { get; set; }
     }
 
+    // ── Arena end-of-match reward packet ─────────────────────────────────────
     /// <summary>
-    /// Server → All: a lootable item has appeared on the ground.
-    /// The client uses DefinitionId to look up the item icon and name.
-    /// InstanceId is included so the client can display stack counts for stackable items.
-    /// </summary>
-    public class GroundItemSpawnedPacket
-    {
-        public int   GroundItemId { get; set; }
-        public int   DefinitionId { get; set; }
-        public float X            { get; set; }
-        public float Y            { get; set; }
-    }
-
-    /// <summary>
-    /// Server → All (interested): a ground item was picked up or despawned.
-    /// Clients destroy the world-object for this GroundItemId on receipt.
-    /// </summary>
-    public class GroundItemRemovedPacket
-    {
-        public int GroundItemId { get; set; }
-    }
-
-    /// <summary>
-    /// Server → owning client: confirms that an item was added to the player's inventory.
-    /// Sent in addition to <see cref="GroundItemRemovedPacket"/> after a successful pickup.
-    /// The client adds the item to its inventory panel on receipt.
-    /// </summary>
-    public class ItemAddedToInventoryPacket
-    {
-        public int DefinitionId { get; set; }
-        public int InstanceId   { get; set; }
-    }
-
-    // ── Session continuity packets ──────────────────────────────────────────────
-
-    /// <summary>
-    /// Server → All: a player's UDP connection dropped but their session is preserved
-    /// for up to the grace-period window (default 5 minutes).  Their entity remains in the
-    /// world as a stationary target; the client should display a disconnected indicator.
-    ///
-    /// If the player reconnects within the grace period they receive
-    /// <see cref="PlayerReconnectedPacket"/> and resume normally.
-    /// If the grace period expires they receive <see cref="EntityDespawnPacket"/> instead.
-    /// </summary>
-    public class PlayerGraceDisconnectPacket
-    {
-        public int EntityId { get; set; }
-    }
-
-    /// <summary>
-    /// Server → All: a player who was in the grace-period window has successfully reconnected.
-    /// The client removes any disconnected indicator and resumes treating the entity as live.
-    /// </summary>
-    public class PlayerReconnectedPacket
-    {
-        public int EntityId { get; set; }
-    }
-
-    // ── Arena end-of-match reward packets ──────────────────────────────────────
-
-    /// <summary>
-    /// Server → owning client: sent at Arena match end with the crafting ingredient rewards
-    /// the player has earned.  Items picked up during the match do NOT persist in Arena mode;
-    /// rewards are always crafting ingredients added to the character's crafting pouch.
-    ///
+    /// Server → owning client: crafting ingredient rewards earned this match.
     /// Format: comma-separated "ingredientId:quantity" pairs, e.g. "1:3,5:1".
     /// The ProfileServer claims these from Redis key <c>crafting-reward:{accountId}</c>.
     /// </summary>

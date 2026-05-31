@@ -27,9 +27,9 @@ to a specific implementation concern. Status markers reflect the current codebas
 
 | # | Goal | Status | Notes |
 |---|------|--------|-------|
-| 1.1 | **Socket & Connection Management** — LiteNetLib lifecycle (Connect / Disconnect / Timeout detection) for thousands of concurrent connections | ✅ | `NetworkManager.cs`; `_pendingAuthPeers` + `DisconnectAuthTimeoutPeers`; plain `Dictionary` enumerator (zero-alloc) |
+| 1.1 | **Socket & Connection Management** — LiteNetLib lifecycle (Connect / Disconnect / Timeout detection) for thousands of concurrent connections | ✅ | `NetworkManager.cs`; `_pendingAuthPeers` + `DisconnectAuthTimeoutPeers`; plain `Dictionary` enumerator (zero-alloc). `OnPeerConnected`, `OnPeerDisconnected`, and `OnNetworkError` log lines offloaded to `ThreadPool.QueueUserWorkItem<TState>` with static lambdas — eliminates string allocation and blocking `Console.WriteLine` I/O from the tick thread during high-churn reconnect scenarios. |
 | 1.2 | **High-Precision 30 Hz Heartbeat** — absolute `Stopwatch` deadline loop with `Thread.SpinWait` sub-millisecond correction; zero drift or time-lag accumulation | ✅ | `ArenaInstance.RunGameLoop`; `nextTickTime += ticksPerTick` (integer division, no float bias); `Thread.Sleep(ms-1)` + `SpinWait` final window |
-| 1.3 | **Packet Serialization & Blitting Engine** — `[StructLayout(Sequential, Pack=1)]` hot-path structs written directly to `NetDataWriter`; zero GC allocation per send | ✅ | All hot-path packets in `SharedLibrary/NetworkPackets.cs`; `PacketEncoding` helpers; quantized `sbyte` axes, fixed-point positions, 24-bit tick encoding |
+| 1.3 | **Packet Serialization & Blitting Engine** — `[StructLayout(Sequential, Pack=1)]` hot-path structs written directly to `NetDataWriter`; zero GC allocation per send | ✅ | All hot-path packets in `SharedLibrary/NetworkPackets.cs`; `PacketEncoding` helpers; quantized `sbyte` axes, fixed-point positions, 24-bit tick encoding. `BroadcastStatusEffects` parameter narrowed from `IReadOnlyList<StatusEffectAppliedPacket>` to `List<StatusEffectAppliedPacket>` — eliminates vtable dispatch on every `.Count` and `[i]` access in AoE combat. `DamageUtils.ClampAndEncode` `context` parameter changed from `string` to `ReadOnlySpan<char>` — string literals at call sites are now zero-allocation stack spans; `SecurityTelemetry.RecordDamageCap` materialises the span to `string` only on the background thread-pool path. `CombatSystem.ProcessSpellCast` / `ProcessAoE` / `ProcessMeleeSplash` and `ProjectileSystem.Tick` / `ApplyExplosiveSplash` parameters narrowed from `IReadOnlyList<PlayerSession>` to `List<PlayerSession>` — eliminates vtable dispatch on every `[i]` and `.Count` access in the AoE and projectile collision inner loops (up to ~12B vtable calls/s eliminated at 2,000-player MMO scale). `SecurityTelemetry.WriteAudit`, `PrintSnapshot`, and `RecordUnauthorizedSpell` fully offloaded to `ThreadPool` via `TState` value-tuples and `static` lambdas — all string interpolation and `Console.WriteLine` I/O now happen off the game-loop thread, including during adversarial violation-flood scenarios. |
 | 1.4 | **Thread-Safe Input Queue** — asynchronous client input arrival queued safely for sequential processing on the next 30 Hz tick | ✅ | `_attackQueue`, `_spellQueue`, `_shootQueue`, `_equipItemQueue`, `_pickupQueue` are plain `Queue<T>` drained on the game-loop thread (all LiteNetLib callbacks fire on that thread via `PollEvents`); movement uses `_latestInputByPeer` dictionary |
 | 1.5 | **State Sync Caching (Redis / Dapper Separation)** — real-time tick changes in hot RAM; DB saves (Dapper / PostgreSQL) strictly on background thread pool | ✅ | `LivePlayerState` in-memory; `PlayerStateSink.FlushAsync` offloads via `Task.Run`; `FinalizeHydration` drains async Redis reads without blocking the loop |
 
@@ -44,7 +44,7 @@ to a specific implementation concern. Status markers reflect the current codebas
 | 2.1 | **Spatial Grid Segmentation** — uniform fixed-cell 2-D spatial hash dividing the world map into virtual grid cells | ✅ | `SpatialGrid.cs`; cell size configurable via `ZoneDescriptor`; rebuilt once per tick after movement (O(cells + N)) |
 | 2.2 | **Entity-to-Cell Hashing** — continuous tracking and shifting of player IDs to correct grid cells as they cross world coordinates | ✅ | `SpatialGrid.RebuildEachTick`; entity IDs mapped to `(cellX, cellY)` buckets; stale entries cleared each tick |
 | 2.3 | **Observer Lists (Network Bubbles)** — dynamic calculation of which clients are within viewing range (target cell + 8 neighbours) | ✅ | `SpatialGrid.QueryNeighbours(origin)` returns pre-allocated 3×3 scratch list in O(1); `IInterestFilter` strategy (`BroadcastFilter` / `RadiusFilter`) swappable per zone via `ZoneDescriptor.EventFilter`; `_viewRadiusSqr` pre-squared to avoid `sqrt` |
-| 2.4 | **Delta Compression Broadcasting** — state updates sent only to relevant observers; entities with no changes filtered out | 🔶 | `BroadcastState` sends position + health structs only to observers via `QueryNeighbours`. Full delta-diff (skip unchanged entities) not yet implemented — every entity in the neighbourhood receives a packet each tick regardless of whether it moved |
+| 2.4 | **Delta Compression Broadcasting** — state updates sent only to relevant observers; entities with no changes filtered out | ✅ | `BroadcastState` skips position packets for entities whose fixed-point encoded X/Y has not changed since last tick; skips health packets when HP encoding is unchanged; own-entity position always sent for client reconciliation. `CommitBroadcastState()` updates `LastBroadcastX/Y/Health` sentinels in one O(N) pass after all viewers are served, ensuring every viewer in a tick sees a consistent changed/unchanged decision. |
 
 ---
 
@@ -110,7 +110,7 @@ to a specific implementation concern. Status markers reflect the current codebas
 |---|------|--------|-------|
 | 7.1 | **Packet Sanity & Size Limits** — drop malicious/corrupted packets violating size guidelines or containing nonsensical values | ✅ | `InputSanitizer.cs` validates shape (no NaN/Inf floats, valid ranges) before packets enter `IntentGuard`; malformed packets dropped and logged via `SecurityTelemetry` |
 | 7.2 | **State Validation Rules** — bar impossible actions (loot through wall, open inventory while dead) | 🔶 | `IntentGuard` enforces auth gate, tick skew, sequence IDs, queue depth. Dead-state action blocking exists in `CombatSystem`. Through-wall interaction checks require collision system (see 3.2). |
-| 7.3 | **Rate-Limiting (DDoS / Spam Protection)** — monitor connection request volumes and per-IP packet inputs; auto-throttle or disconnect flooding clients | ✅ | `IntentGuard` token buckets (movement 60/s, actions 20/s); violation score (disconnect at ≥ 80); `_ipGuards` per-`IPAddress` connection rate tracking in `NetworkManager`; `SecurityTelemetry.RecordDamageCap` off-thread telemetry |
+| 7.3 | **Rate-Limiting (DDoS / Spam Protection)** — monitor connection request volumes and per-IP packet inputs; auto-throttle or disconnect flooding clients | ✅ | `IntentGuard` token buckets (movement 60/s, actions 20/s); violation score (disconnect at ≥ 80); `_ipGuards` per-`IPAddress` connection rate tracking in `NetworkManager`; `SecurityTelemetry` audit and snapshot logging fully off-thread: `WriteAudit`, `PrintSnapshot`, and `RecordUnauthorizedSpell` use `ThreadPool.QueueUserWorkItem<TState>` with static lambdas — zero game-loop-thread string allocation even under adversarial connection/violation floods. |
 
 ---
 
@@ -130,21 +130,20 @@ to a specific implementation concern. Status markers reflect the current codebas
 | Category | ✅ Done | 🔶 Partial | ❌ Not Built |
 |----------|---------|-----------|-------------|
 | 1 · Network & Infrastructure | 5 / 5 | — | — |
-| 2 · Interest Management | 3 / 4 | 1 / 4 | — |
+| 2 · Interest Management | 4 / 4 | — | — |
 | 3 · Movement & Physics | 1 / 3 | — | 2 / 3 |
 | 4 · Combat & Action | 2 / 4 | 2 / 4 | — |
 | 5 · RPG Systems (Arena) | 1 / 2 | 1 / 2 | — |
 | 6 · Lag Compensation | — | 1 / 3 | 2 / 3 |
 | 7 · Security & Anti-Cheat | 2 / 3 | 1 / 3 | — |
 | 8 · Economy & Persistence | 1 / 2 | 1 / 2 | — |
-| **Total** | **15 / 26** | **7 / 26** | **4 / 26** |
+| **Total** | **16 / 26** | **6 / 26** | **4 / 26** |
 
 ### Highest-Priority Phase 1 Gaps
 1. **3.2 Headless Collision** — players can currently walk through walls
 2. **6.2 History Rewind** — hit-scan PvP is not fair at high latency without this
 3. **8.1 Atomic Inventory Transactions** — items can theoretically dupe on network drop
 4. **6.1 Jitter Buffer** — inputs spike under poor network conditions
-5. **2.4 Delta Compression** — every entity in a cell is re-broadcast even when stationary
 
 ---
 

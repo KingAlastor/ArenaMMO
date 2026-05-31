@@ -18,7 +18,7 @@ namespace GameServer.Systems
         /// compile-time ArenaBoundsHalf constant — that would silently clamp players into a
         /// 100×100 box on any map larger than the default arena.
         /// </summary>
-        public static void ProcessInput(PlayerSession player, PlayerInputPacket input,
+        public static void ProcessInput(PlayerSession player, in PlayerInputData input,
                                         float deltaTime, in WorldBounds bounds)
         {
             if (!player.IsAlive)
